@@ -54,11 +54,12 @@ for disk in /dev/sd*; do
   fi
 
   [[ -z "$model" ]] && continue
-  poh=$(smartctl -A "$disk" | awk '/Power_On_Hours/ {print $10}')
-  lu=$(smartctl -A "$disk" | awk '/Load_Cycle_Count/ {print $10}')
-  reall=$(smartctl -A "$disk" | awk '/Reallocated_Sector_Ct/ {print $10}')
-  pend=$(smartctl -A "$disk" | awk '/Current_Pending_Sector/ {print $10}')
-  temp=$(smartctl -A "$disk" | awk '/Temperature_Celsius|Temperature_Internal/ {print $10}' | head -n 1)
+  attrs=$(smartctl -A "$disk")
+  poh=$(echo "$attrs" | awk '/Power_On_Hours/ {print $10}')
+  lu=$(echo "$attrs" | awk '/Load_Cycle_Count/ {print $10}')
+  reall=$(echo "$attrs" | awk '/Reallocated_Sector_Ct/ {print $10}')
+  pend=$(echo "$attrs" | awk '/Current_Pending_Sector/ {print $10}')
+  temp=$(echo "$attrs" | awk '/Temperature_Celsius|Temperature_Internal/ {print $10}' | head -n 1)
 
   poh=${poh:-0}; reall=${reall:-0}; pend=${pend:-0}; temp=${temp:-0}
 
