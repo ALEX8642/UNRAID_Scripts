@@ -164,9 +164,9 @@ done
 echo "$full_report"
 
 if (( critical_issues > 0 )); then
-  /usr/local/emhttp/webGui/scripts/notify -e "SMART Health Report" -s "⚠️ Disk issues detected!" -d "$critical_issues disk(s) flagged with potential failure indicators."
+  /usr/local/emhttp/webGui/scripts/notify -e "SMART Health Report" -s "⚠️ Disk issues detected!" -d "$critical_issues disk(s) flagged with potential failure indicators." -i warning
 else
-  /usr/local/emhttp/webGui/scripts/notify -e "SMART Health Report" -s "✅ All drives healthy" -d "No critical issues detected in SMART scan."
+  /usr/local/emhttp/webGui/scripts/notify -e "SMART Health Report" -s "✅ All drives healthy" -d "No critical issues detected in SMART scan." -i normal
 fi
 
 if (( ${#fw_warning_summary[@]} > 0 )); then
