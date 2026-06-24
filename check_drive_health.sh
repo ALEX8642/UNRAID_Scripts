@@ -55,16 +55,12 @@ for disk in /dev/sd*; do
 
   [[ -z "$model" ]] && continue
   poh=$(smartctl -A "$disk" | awk '/Power_On_Hours/ {print $10}')
-  lu=$(smartctl -A "$disk" | awk '
-    /Load_Cycle_Count/ {lcc=$10}
-    /Start_Stop_Count/ && !lcc {lcc=$10}
-    END {print lcc + 0}'
-  )
+  lu=$(smartctl -A "$disk" | awk '/Load_Cycle_Count/ {print $10}')
   reall=$(smartctl -A "$disk" | awk '/Reallocated_Sector_Ct/ {print $10}')
   pend=$(smartctl -A "$disk" | awk '/Current_Pending_Sector/ {print $10}')
   temp=$(smartctl -A "$disk" | awk '/Temperature_Celsius|Temperature_Internal/ {print $10}' | head -n 1)
 
-  poh=${poh:-0}; lu=${lu:-0}; reall=${reall:-0}; pend=${pend:-0}; temp=${temp:-0}
+  poh=${poh:-0}; reall=${reall:-0}; pend=${pend:-0}; temp=${temp:-0}
 
   class="Unknown"; max_poh=30000; max_lu=300000
   if [[ "$model" == *"Exos"* || "$model" == ST*NM* ]]; then
@@ -90,9 +86,14 @@ for disk in /dev/sd*; do
   fi
 
   pct_poh=$(awk "BEGIN { printf \"%.1f\", (100 * $poh) / $max_poh }")
-  pct_lu=$(awk "BEGIN { printf \"%.1f\", (100 * $lu) / $max_lu }")
-  lu_pct=$(awk "BEGIN { printf \"%.1f\", $lu / $max_lu }")
-  max_pct=$(awk "BEGIN { print ($pct_poh > $pct_lu) ? $pct_poh : $pct_lu }")
+  if [[ -n "$lu" ]]; then
+    pct_lu=$(awk "BEGIN { printf \"%.1f\", (100 * $lu) / $max_lu }")
+    lu_pct=$(awk "BEGIN { printf \"%.1f\", $lu / $max_lu }")
+    max_pct=$(awk "BEGIN { print ($pct_poh > $pct_lu) ? $pct_poh : $pct_lu }")
+  else
+    pct_lu="N/A"
+    max_pct=$pct_poh
+  fi
   erul_days=$(awk "BEGIN { printf \"%d\", (100 - $max_pct) * $max_poh / 100 / 24 }")
   erul_years=$(awk "BEGIN { printf \"%.1f\", $erul_days / 365 }")
 
@@ -100,10 +101,18 @@ for disk in /dev/sd*; do
   (( reall > 0 || pend > 0 )) && health_flags+="❗ Bad sectors, "
   (( temp >= 50 )) && health_flags+="❗ Hot, "
   (( temp >= 45 && temp < 50 )) && health_flags+="🟡 Warm, "
-  awk "BEGIN {exit !($lu_pct > 0.9)}" && health_flags+="❗ Head park near limit, " ||
-  awk "BEGIN {exit !($lu_pct > 0.7)}" && health_flags+="🟡 Head park elevated, "
-  awk "BEGIN {exit !($max_pct >= 90)}" && health_flags+="❗ Near EOL, " ||
-  awk "BEGIN {exit !($max_pct >= 70)}" && health_flags+="🟡 Elevated wear, "
+  if [[ -n "$lu" ]]; then
+    if awk "BEGIN {exit !($lu_pct > 0.9)}"; then
+      health_flags+="❗ Head park near limit, "
+    elif awk "BEGIN {exit !($lu_pct > 0.7)}"; then
+      health_flags+="🟡 Head park elevated, "
+    fi
+  fi
+  if awk "BEGIN {exit !($max_pct >= 90)}"; then
+    health_flags+="❗ Near EOL, "
+  elif awk "BEGIN {exit !($max_pct >= 70)}"; then
+    health_flags+="🟡 Elevated wear, "
+  fi
 
   health_flags=${health_flags%, }
   [[ -z "$health_flags" ]] && health_flags="✅ Normal"
@@ -130,7 +139,11 @@ for disk in /dev/sd*; do
   full_report+=$' ├─ Model:   '"$model"$'\n'
   full_report+=$' ├─ Class:   '"$class"$'\n'
   full_report+=$' ├─ POH:     '"$poh"' hrs ('"$pct_poh"'% used)'$'\n'
-  full_report+=$' ├─ L/U:     '"$lu"' cycles ('"$pct_lu"'% used)'$'\n'
+  if [[ -n "$lu" ]]; then
+    full_report+=$' ├─ L/U:     '"$lu"' cycles ('"$pct_lu"'% used)'$'\n'
+  else
+    full_report+=$' ├─ L/U:     N/A (Load_Cycle_Count not reported)'$'\n'
+  fi
   full_report+=$' ├─ Temp:    '"$temp"'°C'$'\n'
   full_report+=$' ├─ Firmware: '"$fw"$'\n'
   full_report+=$' ├─ Realloc/Pending: '"$reall"' / '"$pend"$'\n'
