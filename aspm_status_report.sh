@@ -62,7 +62,11 @@ while read -r addr; do
 
     # Generate recommendation
     if [[ "$enabled" == "No" && "$capable" == "Yes" && "$optcomp" == "Yes" && "$blocker" == "None" ]]; then
-        note="🔧 Try pcie_aspm=force"
+        if [[ "$addr" =~ ^00:0[16]\. ]]; then
+            note="🔧 ASPM disabled — CPU-attached root port; prefer relocating endpoint to a chipset slot over pcie_aspm=force"
+        else
+            note="🔧 Try pcie_aspm=force"
+        fi
     elif [[ "$blocker" != "None" ]]; then
         case $blocker in
             lsi)   note="❌ LSI blocks ASPM" ;;
