@@ -35,12 +35,12 @@ while read -r addr; do
     name=$(lspci -s "$addr" | cut -d' ' -f 2-)
     info=$(lspci -s "$addr" -vv)
 
-    lnkcap=$(echo "$info" | awk '/LnkCap:/,/LnkCtl:/')
+    lnkcap=$(echo "$info" | grep -m1 'LnkCap:')
     lnkctl=$(echo "$info" | grep -m1 'LnkCtl:')
 
     # Improved detection
     optcomp=$(echo "$lnkcap" | grep -q 'ASPMOptComp+' && echo "Yes" || echo "No")
-    capable=$(echo "$lnkcap" | grep -q 'ASPM' && echo "Yes" || echo "No")
+    capable=$(echo "$lnkcap" | grep -qE 'ASPM L[0-9]' && echo "Yes" || echo "No")
 
     # ASPM enabled
     if [[ "$lnkctl" =~ "ASPM L" ]]; then
