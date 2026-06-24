@@ -33,20 +33,28 @@ for disk in /dev/sd*; do
 
   # Get SMART info and capture stderr
   id_output=$(smartctl -i "$disk" 2>&1)
+  SMART_DTYPE=""
 
   # Skip unsupported USB bridge devices
   if echo "$id_output" | grep -q "Unknown USB bridge"; then
     echo "🔌 Skipping USB device $disk (unsupported USB bridge)" >&2
     continue
-  # Skip SAS transport unless handled explicitly
+  # Retry SATA-behind-HBA with explicit SAT passthrough
   elif echo "$id_output" | grep -q "Transport protocol: SAS"; then
-    echo "🚫 SAS drive detected at $disk. May require -d sat or -d scsi for full SMART support." >&2
-    continue
+    id_retry=$(smartctl -i -d sat "$disk" 2>&1)
+    if echo "$id_retry" | grep -q "Device Model"; then
+      id_output="$id_retry"
+      SMART_DTYPE="-d sat"
+    else
+      echo "🚫 True SAS drive at $disk — skipping (needs -d scsi handling)" >&2
+      continue
+    fi
+  fi
+
   # Parse model and firmware from output if possible
-  elif echo "$id_output" | grep -q "Device Model"; then
+  if echo "$id_output" | grep -q "Device Model"; then
     model=$(echo "$id_output" | awk -F: '/Device Model/ {gsub(/^ +| +$/, "", $2); print $2}')
     fw=$(echo "$id_output" | awk -F: '/Firmware Version/ {gsub(/^ +| +$/, "", $2); print $2}')
-  # Fallback for unknown failure
   else
     echo "❌ smartctl failed for $disk:" >&2
     echo "$id_output" >&2
@@ -54,7 +62,7 @@ for disk in /dev/sd*; do
   fi
 
   [[ -z "$model" ]] && continue
-  attrs=$(smartctl -A "$disk")
+  attrs=$(smartctl -A $SMART_DTYPE "$disk")
   poh=$(echo "$attrs" | awk '/Power_On_Hours/ {print $10}')
   lu=$(echo "$attrs" | awk '/Load_Cycle_Count/ {print $10}')
   reall=$(echo "$attrs" | awk '/Reallocated_Sector_Ct/ {print $10}')
@@ -68,7 +76,7 @@ for disk in /dev/sd*; do
     class="Enterprise (Exos)"; max_poh=60000; max_lu=600000
   elif [[ "$model" == *"WD"* || "$model" == *"Red"* ]]; then
     class="NAS (WD Red)"; max_poh=60000; max_lu=300000
-  elif [[ "$model" == ST*VX* ]]; then
+  elif [[ "$model" =~ ST[0-9]+V[XNHT] ]]; then
     class="Surveillance (SkyHawk)"; max_poh=60000; max_lu=300000
   elif [[ "$model" == ST*VE* ]]; then
     class="Surveillance (SkyHawk AI)"; max_poh=60000; max_lu=300000
@@ -148,7 +156,7 @@ for disk in /dev/sd*; do
   full_report+=$' ├─ Temp:    '"$temp"'°C'$'\n'
   full_report+=$' ├─ Firmware: '"$fw"$'\n'
   full_report+=$' ├─ Realloc/Pending: '"$reall"' / '"$pend"$'\n'
-  full_report+=$' ├─ Est. Remaining Life: '"$erul_years"' years'$'\n'
+  full_report+=$' ├─ Est. Remaining Life (rough approx, not MTBF): '"$erul_years"' years'$'\n'
   full_report+=$' └─ Health Flags: '"$health_flags"$'\n'
 
 done
