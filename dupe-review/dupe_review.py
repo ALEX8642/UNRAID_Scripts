@@ -523,6 +523,69 @@ def fmt_runtime(rec: FileRecord) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-cell "notably better" highlights — separate from the overall ★ suggestion.
+# Never applied when a 4K Remux is in the group (especially from FraMeSToR): a top-tier
+# remux's audio is already about as good as it gets, and DV-profile device compatibility is a
+# narrower concern than remux fidelity, so another file never gets flagged "better" on these
+# specific axes just because it edges out the remux on codec/profile alone.
+# ---------------------------------------------------------------------------
+
+AUDIO_TIER = {
+    "truehd": 3, "dts-hd ma": 3, "flac": 3, "pcm": 3, "dts-hd": 3,
+    "eac3": 1, "e-ac3": 1, "ddp": 1, "dts": 1,
+    "ac3": 0, "dd": 0, "aac": 0,
+}
+
+# Rough device-compatibility ordering, not a quality ordering: profile 8 (single-layer,
+# HDR10-compatible base) plays broadly; profile 7 (dual-layer) needs client-side conversion on
+# most non-DV-native devices; profile 5 (Apple-only, no fallback) is the narrowest.
+DV_PROFILE_COMPAT = {"8": 2, "7": 1, "5": 0}
+
+
+def is_premium_remux(rec: FileRecord) -> bool:
+    height = rec.height or int(rec.media_info.get("resolution", "0x0").split("x")[-1] or 0)
+    return height >= 2000 and "remux" in fmt_source(rec).lower()
+
+
+def audio_rank(rec: FileRecord) -> tuple:
+    label = fmt_audio(rec).lower()
+    tier = 0
+    for key, t in AUDIO_TIER.items():
+        if key in label:
+            tier = max(tier, t)
+    channels = rec.media_info.get("audioChannels") or rec.plex_audio_channels or 0
+    try:
+        channels = float(channels)
+    except (TypeError, ValueError):
+        channels = 0
+    return (tier, channels)
+
+
+def dv_profile_compat(rec: FileRecord) -> Optional[int]:
+    return DV_PROFILE_COMPAT.get(rec.dovi_profile)
+
+
+def compute_highlights(recs: list[FileRecord]) -> dict:
+    """index -> {'audio': bool, 'dv': bool} — cells to render in green."""
+    highlights = {i: {"audio": False, "dv": False} for i in range(len(recs))}
+    if any(is_premium_remux(r) for r in recs):
+        return highlights
+
+    audio_ranks = [audio_rank(r) for r in recs]
+    if len(set(audio_ranks)) > 1:
+        best = max(range(len(recs)), key=lambda i: audio_ranks[i])
+        highlights[best]["audio"] = True
+
+    dv_ranks: list[int] = [r for r in (dv_profile_compat(rec) for rec in recs) if r is not None]
+    comparable = [i for i, r in enumerate(recs) if dv_profile_compat(r) is not None]
+    if len(comparable) >= 2 and len(set(dv_ranks)) > 1:
+        best = max(comparable, key=lambda i: dv_profile_compat(recs[i]) or -1)
+        highlights[best]["dv"] = True
+
+    return highlights
+
+
+# ---------------------------------------------------------------------------
 # Suggestion heuristic — advisory only, never auto-applied
 # ---------------------------------------------------------------------------
 
@@ -597,9 +660,16 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
     table.add_column("Score")
     table.add_column("Seeding")
 
+    highlights = compute_highlights(recs)
     for i, rec in enumerate(recs, start=1):
         marker = "★ " if (suggested is not None and (i - 1) == suggested) else "  "
         row_style = "bold green" if (suggested is not None and (i - 1) == suggested) else None
+        hdr_text = fmt_hdr(rec)
+        if highlights[i - 1]["dv"]:
+            hdr_text = f"[bold green]{hdr_text}[/bold green]"
+        audio_text = fmt_audio(rec)
+        if highlights[i - 1]["audio"]:
+            audio_text = f"[bold green]{audio_text}[/bold green]"
         table.add_row(
             f"{marker}{i}",
             fmt_runtime(rec),
@@ -607,8 +677,8 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
             fmt_source(rec),
             fmt_video_codec(rec),
             fmt_bitrate(rec),
-            fmt_hdr(rec),
-            fmt_audio(rec),
+            hdr_text,
+            audio_text,
             fmt_size(rec.size),
             fmt_release_group(rec),
             rec.tracked_by,
@@ -621,9 +691,12 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
         unmapped_note = "  [bold red]⚠ unrecognized mount — cannot be deleted by this tool[/bold red]" if not rec.path_mapped else ""
         console.print(f"  [{i}] [dim]{rec.path}[/dim]{unmapped_note}")
     if suggested is not None:
-        console.print(f"  [dim]★ suggested keep (based on Radarr/Sonarr score, then resolution, then HDR/DV, then size — advisory only)[/dim]\n")
+        console.print(f"  [dim]★ suggested keep (based on Radarr/Sonarr score, then resolution, then HDR/DV, then size — advisory only)[/dim]")
     else:
-        console.print("  [dim]No suggestion offered — runtimes differ too much to treat these as comparable quality tiers.[/dim]\n")
+        console.print("  [dim]No suggestion offered — runtimes differ too much to treat these as comparable quality tiers.[/dim]")
+    if any(h["audio"] or h["dv"] for h in highlights.values()):
+        console.print("  [dim][bold green]green[/bold green] Audio/HDR-DV cell = notably better audio codec or a more broadly-supported DV profile (suppressed when a 4K Remux is in the group)[/dim]")
+    console.print()
 
 
 def log(msg: str):
@@ -717,23 +790,40 @@ def render_season_cluster(cluster: dict):
         box=box.HEAVY, style="cyan",
     ))
 
+    highlights = compute_highlights([sample_a, sample_b])
+    hdr_a = fmt_hdr(sample_a)
+    hdr_b = fmt_hdr(sample_b)
+    audio_a = fmt_audio(sample_a)
+    audio_b = fmt_audio(sample_b)
+    if highlights[0]["dv"]:
+        hdr_a = f"[bold green]{hdr_a}[/bold green]"
+    if highlights[1]["dv"]:
+        hdr_b = f"[bold green]{hdr_b}[/bold green]"
+    if highlights[0]["audio"]:
+        audio_a = f"[bold green]{audio_a}[/bold green]"
+    if highlights[1]["audio"]:
+        audio_b = f"[bold green]{audio_b}[/bold green]"
+
     table = Table(box=box.SIMPLE_HEAVY)
     for col in ("Side", "Res", "Source", "Video", "HDR/DV", "Audio", "Total Size", "Group", "Tracked", "Score", "Seeding"):
         table.add_column(col)
     table.add_row(
         "A (torrent)", fmt_resolution(sample_a), fmt_source(sample_a), fmt_video_codec(sample_a),
-        fmt_hdr(sample_a), fmt_audio(sample_a), fmt_size(total_a), fmt_release_group(sample_a),
+        hdr_a, audio_a, fmt_size(total_a), fmt_release_group(sample_a),
         sample_a.tracked_by, fmt_score(sample_a), fmt_seeding(sample_a),
     )
     table.add_row(
         "B", fmt_resolution(sample_b), fmt_source(sample_b), fmt_video_codec(sample_b),
-        fmt_hdr(sample_b), fmt_audio(sample_b), fmt_size(total_b), fmt_release_group(sample_b),
+        hdr_b, audio_b, fmt_size(total_b), fmt_release_group(sample_b),
         sample_b.tracked_by, fmt_score(sample_b), fmt_seeding(sample_b),
     )
     console.print(table)
     for _, a, _b in items:
         console.print(f"  [dim]{a.group_title}[/dim]")
-    console.print("  [dim]Side A and B shown from episode 1 as representative — per-episode quality can vary slightly within a season pack.[/dim]\n")
+    console.print("  [dim]Side A and B shown from episode 1 as representative — per-episode quality can vary slightly within a season pack.[/dim]")
+    if any(h["audio"] or h["dv"] for h in highlights.values()):
+        console.print("  [dim][bold green]green[/bold green] Audio/HDR-DV cell = notably better audio codec or a more broadly-supported DV profile (suppressed when a 4K Remux is in the group)[/dim]")
+    console.print()
 
 
 def main():
