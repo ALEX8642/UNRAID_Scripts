@@ -19,6 +19,9 @@ This is my repo for my private Unraid media server setup. It includes custom too
 5. **🗑️ Orphan File Scan**  
    Finds video files sitting on disk under Movies/tv that are referenced by *neither* qBittorrent nor Plex — failed imports, leftover artifacts from a botched move, raw disc-rip remnants left behind after a proper remux was made, files orphaned by a renamed torrent. Cross-references every torrent's actual file list (not just its category folder) and Plex's full library database, so a file only counts as orphaned if both systems genuinely have no record of it. Recently-modified files are flagged separately rather than called orphaned outright, since a fresh file may just not be indexed yet. Defaults to a report; nothing is deleted without `--apply`, which removes only the exact files found (never a directory) and sweeps up now-empty directories as a separate pass afterward.
 
+6. **🚀 Mothership (single entry point)**  
+   One menu for all three tools above, so you don't have to remember which script to run, in what order, or which flags each one takes. Pick one individually, or run all three in the recommended sequence (exact-dup cleanup → quality-based review → orphan sweep) with a single command. Runs each tool's own already-tested code unchanged — this just orchestrates which one runs and prompts for its args.
+
 ---
 
 ### 🔍 HDD SMART Health Monitoring Script
@@ -227,4 +230,83 @@ different file (quality/source/encode, not exact duplicates). Shows a side-by-si
 per title and asks what to keep. Warns when runtimes don't match closely enough to trust a
 suggestion (protects against Plex mis-grouping unrelated files), and flags files still
 actively seeding in qBittorrent. Nothing is deleted without an explicit per-title choice.
+```
+
+---
+### 🗑️ Orphan File Scan Script
+
+Finds video files sitting on disk under Movies/tv that neither qBittorrent nor Plex has any
+record of — failed imports, leftover artifacts from a botched cross-disk move, raw Blu-ray
+disc-rip remnants left behind after a proper remux was made, files orphaned when a torrent
+got renamed or removed. This is the class of dead weight that's easy to accumulate and easy
+to miss, since it doesn't show up as a "duplicate" anywhere — it's just inert bytes nobody
+references any more.
+
+**Key Features:**
+
+- **Cross-references every torrent's full file list**, not just its category folder — a
+  season pack or disc structure has many files under one torrent, and each one needs to be
+  individually recognized as "claimed," not just the parent folder.
+- **Cross-references Plex's complete media library**, not a filtered subset — so a file only
+  counts as orphaned if genuinely neither system has any record of it.
+- **Recently-modified files are flagged separately**, not called orphaned outright — a file
+  that landed in the last 24h may simply not be indexed by Plex yet, or may be a torrent added
+  after the scan started.
+- **File-level, not folder-level, deletion.** `--apply` removes only the exact files found;
+  now-empty directories are swept up as a separate pass afterward, same convention as
+  Library Dedupe.
+- Defaults to a report; nothing is touched without `--apply`.
+
+> 📂 Script path: `orphan-scan/` (Dockerfile + `orphan_scan.py` + `run.sh` + `.env.example`)  
+> 🕒 Recommended: Run after Library Dedupe / Duplicate Version Review, as a final sweep  
+> ⚙️ Requires: Docker, `--network host`, a read-only mount of Plex's `Plug-in Support/Databases`
+> folder, and a read-write mount of your media root (needed for `--apply`). Copy
+> `.env.example` to `.env` and fill in your qBittorrent credentials. Run via `./run.sh`
+> (add `--apply` to actually delete, `--exclude PATH` — repeatable — to hold specific files
+> out of an apply run).
+
+---
+**Example Script Description (for Unraid UI):**
+
+```text
+Finds video files on disk under Movies/tv that neither qBittorrent nor Plex has any record
+of — failed imports, leftover disc-rip remnants, files orphaned by a renamed/removed torrent.
+Cross-references every torrent's full file list and Plex's complete library database.
+Recently-modified files are flagged separately rather than called orphaned outright. Report
+by default; --apply deletes only the exact files found (never a directory) and sweeps up
+now-empty directories afterward.
+```
+
+---
+### 🚀 Mothership Script (single entry point for all three)
+
+The three tools above are independently useful, but remembering which one to run, in what
+order, and which flags each takes is its own chore. This is one menu that picks for you: run
+any of the three individually, or run all three in the order that actually makes sense —
+exact-duplicate cleanup first (cheap, byte-identical wins, no judgment needed), then
+quality-based review (the judgment calls), then an orphan sweep last (catches anything either
+of the first two left behind).
+
+This doesn't reimplement anything — it runs each tool's own already-tested code completely
+unchanged (`dedupe-library.sh` via subprocess, `dupe_review.py`/`orphan_scan.py` imported as
+modules with their existing `sys.argv`-based flag parsing left as-is) and just handles
+picking which one runs, prompting for its flags, and sequencing.
+
+> 📂 Script path: `mothership/` (Dockerfile + `mothership.py` + copies of the other three
+> tools + `run.sh` + `.env.example`)  
+> 🕒 Recommended: Use this instead of the three tools individually, unless you specifically
+> want just one of them  
+> ⚙️ Requires: same as Library Dedupe + Duplicate Version Review + Orphan File Scan combined
+> (this bundles all three into one image). Copy `.env.example` to `.env`, fill in
+> Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN`). Run via `./run.sh` for
+> the interactive menu.
+
+---
+**Example Script Description (for Unraid UI):**
+
+```text
+Single menu for the three library-maintenance tools in this repo (exact-duplicate cleanup,
+quality-based duplicate review, orphan file scan) — pick one to run individually, or run all
+three in the recommended order with one command, instead of remembering three separate
+scripts and their flags. Runs each tool's own already-tested code unchanged.
 ```

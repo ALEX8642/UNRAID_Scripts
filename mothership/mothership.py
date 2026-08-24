@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+mothership.py
+
+Single entry point for the three library-maintenance tools in this repo:
+  1. dedupe-library.sh — exact-duplicate cleanup (loose file vs Radarr/Sonarr-sorted copy,
+     byte-identical only, matched by file size)
+  2. dupe-review.py    — interactive review of titles that exist as more than one genuinely
+     different file (quality/source/encode)
+  3. orphan-scan.py    — files on disk claimed by neither Plex nor qBittorrent
+
+This runs each tool's own, already-tested code completely unchanged — it only picks which
+one(s) to run, prompts for the args each one already supports, and (for "run all") sequences
+them in the order that makes sense: cheap byte-identical wins first, then the judgment calls,
+then a final sweep for anything left behind by either.
+"""
+
+import os
+import subprocess
+import sys
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt, Confirm
+
+console = Console()
+
+sys.path.insert(0, "/app")
+DEDUPE_SH = "/app/dedupe-library.sh"
+
+
+def run_dedupe_sh(apply: bool):
+    args = ["bash", DEDUPE_SH] + (["--apply"] if apply else [])
+    console.print(Panel(f"[bold]dedupe-library.sh[/bold] — {'APPLY' if apply else 'dry run'}", style="cyan"))
+    subprocess.run(args, env=os.environ.copy())
+
+
+def dedupe_flow():
+    console.print(Panel("[bold]Exact-Duplicate Cleanup[/bold]\nByte-identical loose-vs-sorted matches only. Always previews before deleting anything.", style="magenta"))
+    run_dedupe_sh(apply=False)
+    if Confirm.ask("\nApply these deletions now?", default=False):
+        run_dedupe_sh(apply=True)
+        console.print("[dim]Remember: Plex needs a library scan + Empty Trash to stop showing these as duplicates (dupe-review's --reconcile aside, this tool doesn't touch Plex).[/dim]")
+
+
+def call_module_main(module_name: str, argv: list[str]):
+    """Imports/reuses the module, temporarily swaps sys.argv, and calls its main() — catching
+    SystemExit so a guard clause inside that tool (missing creds, qBittorrent down, etc.)
+    returns control to this menu instead of killing the whole mothership process."""
+    module = sys.modules.get(module_name)
+    if module is None:
+        import importlib
+        module = importlib.import_module(module_name)
+    old_argv = sys.argv
+    sys.argv = [f"{module_name}.py"] + argv
+    try:
+        module.main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            console.print(f"[yellow]{module_name} exited early (code {e.code}) — see message above.[/yellow]")
+    finally:
+        sys.argv = old_argv
+
+
+def dupe_review_flow():
+    console.print(Panel("[bold]Quality-Based Duplicate Review[/bold]\nInteractive — every title needs your explicit choice.", style="magenta"))
+    argv = []
+    if Confirm.ask("Preview only (--report-only, no prompts, nothing deleted)?", default=False):
+        argv.append("--report-only")
+    else:
+        if Confirm.ask("Soft-delete to logs/trash/ instead of removing outright (--trash)?", default=False):
+            argv.append("--trash")
+        if Confirm.ask("Ask Radarr/Sonarr to re-import a kept loose file (--reconcile)? Leave off if you rely on stale records to stop re-grabs.", default=False):
+            argv.append("--reconcile")
+    if Confirm.ask("Start fresh, ignoring previously-reviewed titles (--reset)?", default=False):
+        argv.append("--reset")
+    call_module_main("dupe_review", argv)
+
+
+def orphan_scan_flow():
+    console.print(Panel("[bold]Orphan File Scan[/bold]\nFiles claimed by neither Plex nor qBittorrent.", style="magenta"))
+    argv = []
+    if Confirm.ask("Apply deletions this run (default is report-only)?", default=False):
+        argv.append("--apply")
+        extra = Prompt.ask("Any paths to exclude? (comma-separated, blank for none)", default="")
+        for p in [x.strip() for x in extra.split(",") if x.strip()]:
+            argv += ["--exclude", p]
+    call_module_main("orphan_scan", argv)
+
+
+def run_all():
+    console.print(Panel(
+        "[bold]Running all three in the recommended order:[/bold]\n"
+        "1. Exact-duplicate cleanup (cheap, byte-identical wins)\n"
+        "2. Quality-based duplicate review (judgment calls)\n"
+        "3. Orphan scan (final sweep for anything left behind)",
+        style="magenta",
+    ))
+    dedupe_flow()
+    console.print()
+    dupe_review_flow()
+    console.print()
+    orphan_scan_flow()
+    console.print(Panel("[bold green]All three done.[/bold green]", style="green"))
+
+
+MENU = {
+    "1": ("Exact-duplicate cleanup (dedupe-library.sh)", dedupe_flow),
+    "2": ("Quality-based duplicate review (dupe-review)", dupe_review_flow),
+    "3": ("Orphan file scan", orphan_scan_flow),
+    "4": ("Run all three, in the recommended order", run_all),
+    "q": ("Quit", None),
+}
+
+
+def main():
+    console.print(Panel("[bold]Plex Library Maintenance[/bold]", style="magenta"))
+    while True:
+        console.print()
+        for key, (label, _) in MENU.items():
+            console.print(f"  [bold]{key}[/bold]. {label}")
+        choice = Prompt.ask("\nChoice", choices=list(MENU.keys()), default="4")
+        if choice == "q":
+            break
+        _, fn = MENU[choice]
+        console.print()
+        fn()
+
+
+if __name__ == "__main__":
+    main()

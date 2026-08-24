@@ -1,3 +1,4 @@
 **/.env
 dupe-review/logs/
 orphan-scan/logs/
+mothership/logs/
