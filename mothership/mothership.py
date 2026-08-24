@@ -112,8 +112,43 @@ MENU = {
     "q": ("Quit", None),
 }
 
+SUBCOMMANDS = {"dedupe", "dupe-review", "orphan-scan"}
+
+
+def run_subcommand(name: str, rest: list[str]):
+    """Non-interactive entry point — runs one tool directly with the given args, no menu, no
+    extra prompts beyond what that tool already asks on its own (e.g. dupe-review's per-title
+    choices). For scripted/cron use, such as a scheduled `mothership.py dedupe --apply` run."""
+    if name == "dedupe":
+        run_dedupe_sh(apply="--apply" in rest)
+    elif name == "dupe-review":
+        call_module_main("dupe_review", rest)
+    elif name == "orphan-scan":
+        call_module_main("orphan_scan", rest)
+
+
+def print_help():
+    console.print(
+        "[bold]Usage:[/bold]\n"
+        "  mothership.py                          Interactive menu\n"
+        "  mothership.py dedupe [--apply]\n"
+        "  mothership.py dupe-review [--report-only] [--trash] [--reconcile] [--reset]\n"
+        "  mothership.py orphan-scan [--apply] [--exclude PATH ...]\n\n"
+        "Subcommands run directly with no extra menu prompts — for scripted/cron use (e.g. a\n"
+        "scheduled 'mothership.py dedupe --apply' run). Omit the subcommand for the\n"
+        "interactive menu."
+    )
+
 
 def main():
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help"):
+        print_help()
+        return
+    if argv and argv[0] in SUBCOMMANDS:
+        run_subcommand(argv[0], argv[1:])
+        return
+
     console.print(Panel("[bold]Plex Library Maintenance[/bold]", style="magenta"))
     while True:
         console.print()

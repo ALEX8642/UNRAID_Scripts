@@ -10,17 +10,13 @@ This is my repo for my private Unraid media server setup. It includes custom too
 2. **⚡ PCIe ASPM Diagnostics**  
    Detects ASPM capability, status, and known blockers (e.g., LSI, ASM, PLX) with actionable summaries and notification support.
 
-3. **🧹 Library Dedupe (Radarr/Sonarr + qBittorrent)**  
-   Finds titles that exist twice — once as a loose, qBittorrent-seeded file outside Radarr/Sonarr's recognized structure, and once as the properly sorted library copy — and removes the sorted duplicate, keeping the seeding copy intact. Matches by exact file size at individual-file granularity (safe for TV season packs, where a season folder holds many episodes). Defaults to a dry run; nothing is deleted without `--apply`.
+3. **🚀 Plex Library Maintenance Toolkit (`mothership/`)**  
+   One Docker image, one entry point, three modes for keeping a Radarr/Sonarr + qBittorrent + Plex library lean:
+   - **Exact-duplicate cleanup** — a title existing twice on disk (once as qBittorrent's loose seeding copy, once as Radarr/Sonarr's sorted copy) gets the sorted duplicate removed, byte-identical matches only. Dry run by default.
+   - **Quality-based duplicate review** — an interactive rich-terminal walkthrough for titles that exist as more than one *genuinely different* file (different resolution/source/encode). Shows a side-by-side comparison — Plex's own probed metadata plus Radarr/Sonarr's real quality score — and asks what to keep, per title. Nothing is deleted without an explicit choice.
+   - **Orphan file scan** — finds video files on disk that neither qBittorrent nor Plex has any record of (failed imports, disc-rip remnants, files orphaned by a renamed torrent). Report by default.
 
-4. **🎬 Duplicate Version Review (interactive)**  
-   For titles that exist as more than one *genuinely different* file — different resolution, source, or encode, not exact duplicates — this walks you through each one in a rich terminal UI: a side-by-side comparison table (resolution, bitrate, codec, HDR/DV, audio, size, release group) pulled from Plex's own probed metadata plus Radarr/Sonarr's actual customFormatScore for whichever copy each app tracks. Flags files still actively seeding in qBittorrent, and refuses to suggest a "best" pick when runtimes don't match closely enough to be confident it's really the same content (protects against Plex having mis-grouped unrelated files under one title). You choose what to keep per title; nothing is deleted without an explicit choice.
-
-5. **🗑️ Orphan File Scan**  
-   Finds video files sitting on disk under Movies/tv that are referenced by *neither* qBittorrent nor Plex — failed imports, leftover artifacts from a botched move, raw disc-rip remnants left behind after a proper remux was made, files orphaned by a renamed torrent. Cross-references every torrent's actual file list (not just its category folder) and Plex's full library database, so a file only counts as orphaned if both systems genuinely have no record of it. Recently-modified files are flagged separately rather than called orphaned outright, since a fresh file may just not be indexed yet. Defaults to a report; nothing is deleted without `--apply`, which removes only the exact files found (never a directory) and sweeps up now-empty directories as a separate pass afterward.
-
-6. **🚀 Mothership (single entry point)**  
-   One menu for all three tools above, so you don't have to remember which script to run, in what order, or which flags each one takes. Pick one individually, or run all three in the recommended sequence (exact-dup cleanup → quality-based review → orphan sweep) with a single command. Runs each tool's own already-tested code unchanged — this just orchestrates which one runs and prompts for its args.
+   Run any one interactively via a menu, run all three in the sequence that makes sense (cheap byte-identical wins → judgment calls → final sweep), or invoke a specific mode non-interactively for scripted/cron use (`mothership.py dedupe --apply`). See below for the full breakdown of each mode.
 
 ---
 
@@ -106,18 +102,28 @@ Scans all PCIe devices and reports ASPM status (Active State Power Management). 
 ```
 
 ---
-### 🧹 Library Dedupe Script (Radarr/Sonarr + qBittorrent)
+### 🚀 Plex Library Maintenance Toolkit (`mothership/`)
 
-If you hardlink-seed with qBittorrent alongside Radarr/Sonarr, it's easy to end up with a
-title existing twice on disk: once as the raw, scene-named file qBittorrent is actively
-seeding (living outside Radarr/Sonarr's recognized folder structure), and once as the
-properly renamed/sorted copy Radarr/Sonarr and Plex actually use. If those two copies ever
-stop being a true hardlink (e.g. from a cross-disk move, or downloads/library briefly using
-cache), you're silently paying for the same file twice. This script finds those pairs and
-removes the sorted duplicate, keeping the loose copy so qBittorrent keeps seeding
-uninterrupted.
+If you hardlink-seed with qBittorrent alongside Radarr/Sonarr, a library accumulates a few
+predictable kinds of waste: titles duplicated between qBittorrent's loose seeding copy and
+Radarr/Sonarr's sorted copy (byte-identical, or genuinely different quality/source), and
+files neither system has any record of any more. This is one Docker image with three modes
+for cleaning that up, plus a menu so you don't have to remember which mode to run, in what
+order, or which flags each one takes.
 
-**Key Features:**
+Every mode defaults to a dry run / report and requires an explicit choice or `--apply` before
+touching anything. Run interactively (`./run.sh`) for a menu, or invoke a mode directly and
+non-interactively for scripted/cron use — `./run.sh dedupe --apply`, `./run.sh orphan-scan`,
+etc. — with no menu prompts in the way.
+
+#### Mode 1 — Exact-duplicate cleanup
+
+Finds titles existing twice on disk — once as the raw, scene-named file qBittorrent is
+actively seeding (living outside Radarr/Sonarr's recognized folder structure), and once as
+the properly renamed/sorted copy Radarr/Sonarr and Plex actually use — and removes the sorted
+duplicate, keeping the loose copy so qBittorrent keeps seeding uninterrupted. If those two
+copies ever stop being a true hardlink (a cross-disk move, downloads/library briefly using
+cache), you're silently paying for the same file twice; this is what catches that.
 
 - **Matches by exact file size** within each app's own library tree — only acts on a match
   that's unique (exactly one candidate); ambiguous matches are skipped and logged, never
@@ -134,44 +140,24 @@ uninterrupted.
   nothing is touched until you pass `--apply`.
 - Logs every run (matches, skips, and reasons) to a logfile for review.
 
-> 📂 Script path: `user.scripts/Library_Dedupe`  
-> 🕒 Recommended: Run occasionally (manually, or scheduled via User Scripts) as new content
-> accumulates  
-> ⚙️ Requires: `curl`, `jq`; a Radarr and/or Sonarr instance with API access, and
-> qBittorrent's WebUI API enabled. Edit the CONFIG block at the top of the script with your
-> own API keys/credentials and library paths before running — ship it with placeholders, not
-> real secrets.
+**CLI:** `mothership.py dedupe [--apply]`
 
----
-**Example Script Description (for Unraid UI):**
+#### Mode 2 — Quality-based duplicate review (interactive, rich terminal UI)
 
-```text
-Finds titles duplicated between a loose qBittorrent-seeded file and Radarr/Sonarr's sorted
-library copy, and deletes the sorted duplicate while preserving the seeding file. Matches by
-exact file size, file-level granularity (safe for TV season packs), skips ambiguous matches,
-and protects recent/actively-seeding content from deletion (hit-and-run safe). Dry-run by
-default — pass --apply to actually delete.
-```
-
----
-### 🎬 Duplicate Version Review Script (interactive, rich terminal UI)
-
-The exact-size dedupe script above only handles *true* duplicates — the same bytes sitting in
-two places. It deliberately leaves alone titles that exist as more than one file where the
-files are genuinely different (a 1080p Remux next to a 4K WEB-DL, an SDR encode next to a
-Dolby Vision one, etc.) — that's a real quality/preference decision, not something safe to
-automate. This script makes reviewing that backlog fast without taking the decision away from
+Exact-duplicate cleanup only handles *true* duplicates — the same bytes sitting in two
+places. It deliberately leaves alone titles that exist as more than one file where the files
+are genuinely different (a 1080p Remux next to a 4K WEB-DL, an SDR encode next to a Dolby
+Vision one, etc.) — that's a real quality/preference decision, not something safe to
+automate. This mode makes reviewing that backlog fast without taking the decision away from
 you: for every title Plex already knows has more than one version, it prints a full
 side-by-side comparison and asks what to keep.
-
-**Key Features:**
 
 - **Reads Plex's own probed metadata** (resolution, bitrate, codec, HDR/DV, audio) instead of
   re-parsing filenames — Plex already ran ffprobe on every file, and already grouped
   same-title files together as "versions."
 - **Pulls the real Radarr/Sonarr customFormatScore** for whichever file each app currently
   tracks, straight from their API — reflects your actual configured quality-profile
-  preferences rather than a guess this script invents.
+  preferences rather than a guess this tool invents.
 - **Runtime-mismatch guard**: if the "versions" of a title have runtimes that don't match
   closely, it refuses to suggest a "best" pick and prints a loud warning instead. Plex
   occasionally mis-groups unrelated files (e.g. a multi-track music demo disc) under one
@@ -209,31 +195,9 @@ side-by-side comparison and asks what to keep.
   "reviewed" state is tied to its specific file set (path+size), so if a new duplicate shows up
   for a title you already decided on, it resurfaces instead of staying silently skipped.
 
-> 📂 Script path: `dupe-review/` (Dockerfile + `dupe_review.py` + `run.sh` + `.env.example`)  
-> 🕒 Recommended: Run after the exact-size dedupe script, as a periodic cleanup pass  
-> ⚙️ Requires: Docker (builds a small `python:3.12-slim` image with `rich`+`requests`, run with
-> `--network host` so it can reach Radarr/Sonarr/qBittorrent on `localhost`); a read-only bind
-> mount of Plex's `Plug-in Support/Databases` folder, and a read-write mount of your media root
-> (needed to actually delete/trash files). Copy `.env.example` to `.env` in the same directory
-> and fill in your Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN`) —
-> `.env` is gitignored, never commit real values. Run via `./run.sh` (add `--report-only` to
-> preview without prompts, `--trash` for soft-delete, `--reconcile` to opt in to Radarr/Sonarr
-> re-import, `--reset` to re-review everything).
+**CLI:** `mothership.py dupe-review [--report-only] [--trash] [--reconcile] [--reset]`
 
----
-**Example Script Description (for Unraid UI):**
-
-```text
-Interactive rich-terminal review of Plex titles that exist as more than one genuinely
-different file (quality/source/encode, not exact duplicates). Shows a side-by-side comparison
-(resolution, bitrate, codec, HDR/DV, audio, size, release group, Radarr/Sonarr quality score)
-per title and asks what to keep. Warns when runtimes don't match closely enough to trust a
-suggestion (protects against Plex mis-grouping unrelated files), and flags files still
-actively seeding in qBittorrent. Nothing is deleted without an explicit per-title choice.
-```
-
----
-### 🗑️ Orphan File Scan Script
+#### Mode 3 — Orphan file scan
 
 Finds video files sitting on disk under Movies/tv that neither qBittorrent nor Plex has any
 record of — failed imports, leftover artifacts from a botched cross-disk move, raw Blu-ray
@@ -241,8 +205,6 @@ disc-rip remnants left behind after a proper remux was made, files orphaned when
 got renamed or removed. This is the class of dead weight that's easy to accumulate and easy
 to miss, since it doesn't show up as a "duplicate" anywhere — it's just inert bytes nobody
 references any more.
-
-**Key Features:**
 
 - **Cross-references every torrent's full file list**, not just its category folder — a
   season pack or disc structure has many files under one torrent, and each one needs to be
@@ -254,59 +216,35 @@ references any more.
   after the scan started.
 - **File-level, not folder-level, deletion.** `--apply` removes only the exact files found;
   now-empty directories are swept up as a separate pass afterward, same convention as
-  Library Dedupe.
+  Mode 1.
 - Defaults to a report; nothing is touched without `--apply`.
 
-> 📂 Script path: `orphan-scan/` (Dockerfile + `orphan_scan.py` + `run.sh` + `.env.example`)  
-> 🕒 Recommended: Run after Library Dedupe / Duplicate Version Review, as a final sweep  
-> ⚙️ Requires: Docker, `--network host`, a read-only mount of Plex's `Plug-in Support/Databases`
-> folder, and a read-write mount of your media root (needed for `--apply`). Copy
-> `.env.example` to `.env` and fill in your qBittorrent credentials. Run via `./run.sh`
-> (add `--apply` to actually delete, `--exclude PATH` — repeatable — to hold specific files
-> out of an apply run).
+**CLI:** `mothership.py orphan-scan [--apply] [--exclude PATH ...]` (`--exclude` is repeatable)
+
+#### Setup
+
+> 📂 Script path: `mothership/` (Dockerfile + `mothership.py` + `common.py` + the underlying
+> tool for each mode + `run.sh` + `.env.example`)  
+> 🕒 Recommended: Run occasionally as new content accumulates — Mode 1 first, then Mode 2, then
+> Mode 3, or just pick "run all three" from the menu  
+> ⚙️ Requires: Docker (builds a `python:3.12-slim` image with `bash`/`curl`/`jq` for Mode 1 and
+> `rich`/`requests` for Modes 2-3, run with `--network host` so it can reach
+> Radarr/Sonarr/qBittorrent on `localhost`); a read-only bind mount of Plex's
+> `Plug-in Support/Databases` folder, and a read-write mount of your media root (needed to
+> actually delete/trash files). Copy `.env.example` to `.env` in the same directory and fill
+> in your Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN` for Mode 2's
+> auto-refresh) — `.env` is gitignored, never commit real values. Run via `./run.sh` for the
+> interactive menu, or `./run.sh <mode> [flags]` to skip straight to one mode non-interactively.
 
 ---
 **Example Script Description (for Unraid UI):**
 
 ```text
-Finds video files on disk under Movies/tv that neither qBittorrent nor Plex has any record
-of — failed imports, leftover disc-rip remnants, files orphaned by a renamed/removed torrent.
-Cross-references every torrent's full file list and Plex's complete library database.
-Recently-modified files are flagged separately rather than called orphaned outright. Report
-by default; --apply deletes only the exact files found (never a directory) and sweeps up
-now-empty directories afterward.
-```
-
----
-### 🚀 Mothership Script (single entry point for all three)
-
-The three tools above are independently useful, but remembering which one to run, in what
-order, and which flags each takes is its own chore. This is one menu that picks for you: run
-any of the three individually, or run all three in the order that actually makes sense —
-exact-duplicate cleanup first (cheap, byte-identical wins, no judgment needed), then
-quality-based review (the judgment calls), then an orphan sweep last (catches anything either
-of the first two left behind).
-
-This doesn't reimplement anything — it runs each tool's own already-tested code completely
-unchanged (`dedupe-library.sh` via subprocess, `dupe_review.py`/`orphan_scan.py` imported as
-modules with their existing `sys.argv`-based flag parsing left as-is) and just handles
-picking which one runs, prompting for its flags, and sequencing.
-
-> 📂 Script path: `mothership/` (Dockerfile + `mothership.py` + copies of the other three
-> tools + `run.sh` + `.env.example`)  
-> 🕒 Recommended: Use this instead of the three tools individually, unless you specifically
-> want just one of them  
-> ⚙️ Requires: same as Library Dedupe + Duplicate Version Review + Orphan File Scan combined
-> (this bundles all three into one image). Copy `.env.example` to `.env`, fill in
-> Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN`). Run via `./run.sh` for
-> the interactive menu.
-
----
-**Example Script Description (for Unraid UI):**
-
-```text
-Single menu for the three library-maintenance tools in this repo (exact-duplicate cleanup,
-quality-based duplicate review, orphan file scan) — pick one to run individually, or run all
-three in the recommended order with one command, instead of remembering three separate
-scripts and their flags. Runs each tool's own already-tested code unchanged.
+One Docker image, three modes for keeping a Radarr/Sonarr + qBittorrent + Plex library lean:
+exact-duplicate cleanup (byte-identical loose-vs-sorted matches, hit-and-run safe), an
+interactive rich-terminal review for titles that exist as more than one genuinely different
+file (quality/source/encode), and an orphan file scan (files neither qBittorrent nor Plex has
+any record of). Every mode defaults to a dry run/report; nothing is deleted without an
+explicit choice or --apply. Run interactively via a menu, or invoke a mode directly and
+non-interactively for scripted/cron use.
 ```
