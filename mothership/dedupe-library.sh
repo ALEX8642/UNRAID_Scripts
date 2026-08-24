@@ -86,10 +86,19 @@ build_qbit_index() {
     log "FATAL: qBittorrent torrents/info call failed (HTTP $torrents_http). Refusing to run without a working H&R safety check."
     exit 1
   fi
+  # Bare-path rules (no trailing slash) come first: qBittorrent reports a multi-file torrent's
+  # content_path as exactly "/movies" or "/tv" (no trailing slash) when "Keep top level folder"
+  # is off, and matching only the slash-terminated form silently drops that torrent from the
+  # H&R index entirely — confirmed against 8 real torrents (Vikings S01-S05, The Score,
+  # Marauders). Same failure mode as to_host_path() in common.py; fixed the same way here.
   printf '%s' "$torrents_json" | jq -r '.[] | .content_path' \
-    | sed -e "s|^/movies/|$MOVIES_HOST_ROOT/|" \
+    | sed -e "s|^/movies\$|$MOVIES_HOST_ROOT|" \
+          -e "s|^/movies/|$MOVIES_HOST_ROOT/|" \
+          -e "s|^/tv\$|$TV_HOST_ROOT|" \
           -e "s|^/tv/|$TV_HOST_ROOT/|" \
+          -e "s|^/arr/movies\$|/mnt/user/Media/arr/movies|" \
           -e "s|^/arr/movies/|/mnt/user/Media/arr/movies/|" \
+          -e "s|^/arr/shows\$|/mnt/user/Media/arr/shows|" \
           -e "s|^/arr/shows/|/mnt/user/Media/arr/shows/|" \
     > "$WORKDIR/qbit_paths.txt"
   if [ ! -s "$WORKDIR/qbit_paths.txt" ]; then
