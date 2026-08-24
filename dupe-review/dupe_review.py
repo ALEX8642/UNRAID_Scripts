@@ -59,6 +59,13 @@ PATH_MAP = [
     ("/arr/shows/", "/mnt/user/Media/arr/shows/"),
 ]
 
+# Plex library_sections.id for the Movies/TV libraries Radarr/Sonarr manage — i.e. the ones
+# PATH_MAP actually covers. Plex's "movie" metadata_type also covers other section types (Home
+# Videos, Music Videos, Demo discs, etc.) that live under different host mounts PATH_MAP knows
+# nothing about; without this filter those show up as "duplicates" too and can't be deleted.
+# Check yours with: SELECT id, name, section_type FROM library_sections;
+PLEX_LIBRARY_SECTION_IDS = [1, 2]
+
 LOGFILE = "/logs/dupe-review.log"
 STATE_FILE = "/logs/dupe-review-state.json"
 
@@ -119,6 +126,9 @@ class FileRecord:
     custom_format_score: Optional[int] = None
     media_info: dict = field(default_factory=dict)
     actively_seeding: bool = False
+    path_mapped: bool = True  # False if no PATH_MAP prefix matched — deletion refused
+    season_key: str = ""  # "<show>::S<NN>" for episodes, "" for movies — used to batch a season
+    torrent_hash: str = ""  # qBittorrent hash this file belongs to, if any
 
 
 def open_plex_db():
@@ -131,8 +141,9 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
 
+    section_placeholders = ",".join("?" * len(PLEX_LIBRARY_SECTION_IDS))
     cur.execute(
-        """
+        f"""
         SELECT m.metadata_type, m.id AS metadata_item_id, m.title, m.year,
                m."index" AS ep_index, m.parent_id,
                mi.id AS media_item_id, mi.width, mi.height, mi.bitrate, mi.duration,
@@ -142,13 +153,16 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
         JOIN media_items mi ON mi.metadata_item_id = m.id AND mi.deleted_at IS NULL
         JOIN media_parts mp ON mp.media_item_id = mi.id
         WHERE m.metadata_type IN (1, 4)
+          AND mi.library_section_id IN ({section_placeholders})
           AND m.id IN (
             SELECT metadata_item_id FROM media_items
             WHERE deleted_at IS NULL
+              AND library_section_id IN ({section_placeholders})
             GROUP BY metadata_item_id HAVING COUNT(*) > 1
           )
         ORDER BY m.metadata_type, m.id
-        """
+        """,
+        PLEX_LIBRARY_SECTION_IDS + PLEX_LIBRARY_SECTION_IDS,
     )
     rows = cur.fetchall()
     progress.update(task, total=len(rows) + 2)
@@ -156,6 +170,7 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
     # Episode parent hierarchy (show/season titles) for episode groups
     ep_ids = sorted({r["metadata_item_id"] for r in rows if r["metadata_type"] == 4})
     ep_titles = {}
+    ep_season_keys = {}
     if ep_ids:
         placeholders = ",".join("?" * len(ep_ids))
         cur.execute(
@@ -174,6 +189,7 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
             ep_num = r["ep_num"] if r["ep_num"] is not None else 0
             label = f"{r['show_title']} - S{season_num:02d}E{ep_num:02d} - {r['ep_title']}"
             ep_titles[r["id"]] = label
+            ep_season_keys[r["id"]] = f"{r['show_title']}::S{season_num:02d}"
     progress.advance(task)
 
     # Streams (video HDR/DV + audio) for every media_item involved
@@ -204,17 +220,22 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
             group_title = ep_titles.get(r["metadata_item_id"], r["title"])
         group_key = f"{kind}:{r['metadata_item_id']}"
 
+        # Plex stores paths using its own container convention (e.g. "/tv/Show.mkv"). Convert
+        # to the real host path immediately — this is the path actually used for deletion,
+        # mtime checks, and display, so there is exactly one source of truth rather than a raw
+        # Plex path that quietly never gets translated before os.remove().
+        host_path = to_host_path(r["file"])
+        path_mapped = any(host_path.startswith(host) for _, host in PATH_MAP)
+
         rec = FileRecord(
             group_key=group_key,
             group_title=group_title,
             group_kind=kind,
             media_item_id=r["media_item_id"],
             metadata_item_id=r["metadata_item_id"],
-            # Plex stores paths using its own container convention (e.g. "/tv/Show.mkv").
-            # Convert to the real host path immediately — this is the path actually used for
-            # deletion, mtime checks, and display, so there is exactly one source of truth
-            # rather than a raw Plex path that quietly never gets translated before os.remove().
-            path=to_host_path(r["file"]),
+            path=host_path,
+            path_mapped=path_mapped,
+            season_key=ep_season_keys.get(r["metadata_item_id"], ""),
             size=r["size"] or 0,
             width=r["width"] or 0,
             height=r["height"] or 0,
@@ -315,16 +336,17 @@ def enrich_with_arr(rec: FileRecord, radarr_idx: dict, sonarr_idx: dict):
 # qBittorrent active-seeding index (hit-and-run guard, same as dedupe-library.sh)
 # ---------------------------------------------------------------------------
 
-def load_qbit_active_paths() -> set:
+def load_qbit_index() -> dict:
+    """host path (file or folder) -> torrent hash, for every torrent's content_path."""
     s = requests.Session()
     login = s.post(f"{QBIT_URL}/api/v2/auth/login", data={"username": QBIT_USER, "password": QBIT_PASS}, timeout=15)
     if login.status_code != 200 or login.text.strip() != "Ok.":
         console.print("[bold red]WARNING:[/bold red] could not log into qBittorrent — seeding-safety check is DISABLED for this run.")
-        return set()
+        return {}
     r = s.get(f"{QBIT_URL}/api/v2/torrents/info", timeout=30)
     r.raise_for_status()
     degenerate = {prefix.rstrip("/") for prefix, _ in PATH_MAP}
-    paths = set()
+    index = {}
     for t in r.json():
         cp = (t.get("content_path", "") or "").rstrip("/")
         if not cp or cp in degenerate:
@@ -333,15 +355,19 @@ def load_qbit_active_paths() -> set:
             # path" check below would then match every single file in that library as
             # actively-seeding.
             continue
-        paths.add(to_host_path(cp))
-    return paths
+        index[to_host_path(cp)] = t.get("hash", "")
+    return index
 
 
-def is_actively_seeding(path: str, qbit_paths: set) -> bool:
-    for p in qbit_paths:
+def is_actively_seeding(path: str, qbit_index: dict) -> bool:
+    return torrent_hash_for(path, qbit_index) is not None
+
+
+def torrent_hash_for(path: str, qbit_index: dict) -> Optional[str]:
+    for p, h in qbit_index.items():
         if path == p or path.startswith(p + "/"):
-            return True
-    return False
+            return h
+    return None
 
 
 def file_age_days(path: str) -> int:
@@ -489,11 +515,16 @@ def suggest_index(recs: list[FileRecord]) -> Optional[int]:
         return None
 
     def key(rec: FileRecord):
-        score = rec.custom_format_score if rec.custom_format_score is not None else -999999
+        # Resolution and HDR/DV are objective and always known; the Radarr/Sonarr score is only
+        # known for whichever file that app happens to track. An untracked file with no score
+        # is not a *worse* file — it's an unscored one — so score must not outrank resolution/
+        # HDR or it'll pick a tracked SDR copy over an untracked Dolby Vision one of the same
+        # or higher resolution. Score only breaks ties between files already equal on those.
         height = rec.height or int(rec.media_info.get("resolution", "0x0").split("x")[-1] or 0)
         hdr_rank = 2 if ("dolby vision" in fmt_hdr(rec).lower() or rec.dovi_present) else \
                    1 if fmt_hdr(rec) not in ("SDR", "") else 0
-        return (score, height, hdr_rank, rec.size)
+        score = rec.custom_format_score if rec.custom_format_score is not None else 0
+        return (height, hdr_rank, score, rec.size)
     best = max(range(len(recs)), key=lambda i: key(recs[i]))
     return best
 
@@ -502,12 +533,14 @@ def suggest_index(recs: list[FileRecord]) -> Optional[int]:
 # Main
 # ---------------------------------------------------------------------------
 
-def build_groups(radarr_idx, sonarr_idx, qbit_paths, progress, task):
+def build_groups(radarr_idx, sonarr_idx, qbit_index, progress, task):
     records = load_plex_duplicate_groups(progress, task)
     groups: dict[str, list[FileRecord]] = {}
     for rec in records:
         enrich_with_arr(rec, radarr_idx, sonarr_idx)
-        rec.actively_seeding = is_actively_seeding(rec.path, qbit_paths)
+        h = torrent_hash_for(rec.path, qbit_index)
+        rec.actively_seeding = h is not None
+        rec.torrent_hash = h or ""
         groups.setdefault(rec.group_key, []).append(rec)
     return groups
 
@@ -595,6 +628,97 @@ def save_state(done: set):
         json.dump(sorted(done), f)
 
 
+def delete_one(rec: FileRecord, to_keep: list[FileRecord]) -> str:
+    """Deletes rec.path, printing its own status line. Returns 'deleted', 'declined'
+    (user chose not to touch an actively-seeding file), 'unmapped', or 'error'."""
+    if not rec.path_mapped:
+        console.print(f"    [red]Refusing to delete — path doesn't match any known host mount: {rec.path}[/red]")
+        return "unmapped"
+    if rec.actively_seeding and file_age_days(rec.path) < PROTECT_AGE_DAYS:
+        confirm = Prompt.ask(
+            f"    [bold red]⚠ ACTIVE torrent, only {file_age_days(rec.path)}d old — deleting may trigger a hit-and-run.[/bold red] Delete anyway? [y/N]",
+            default="n",
+        ).strip().lower()
+        if confirm != "y":
+            console.print("    [yellow]Skipped that file.[/yellow]")
+            return "declined"
+    try:
+        os.remove(rec.path)
+        log(f"DELETED: {rec.path} (kept: {[r.path for r in to_keep]})")
+        console.print(f"    [green]Deleted.[/green]")
+        return "deleted"
+    except OSError as e:
+        console.print(f"    [red]Failed to delete {rec.path}: {e}[/red]")
+        log(f"FAILED to delete {rec.path}: {e}")
+        return "error"
+
+
+# ---------------------------------------------------------------------------
+# Season batching — when every episode in a season has one side sharing the same
+# qBittorrent torrent (a season-pack grab vs the individually Sonarr-managed copies),
+# review the whole season as one decision instead of once per episode.
+# ---------------------------------------------------------------------------
+
+def build_season_clusters(groups: dict) -> list[dict]:
+    buckets: dict[tuple, list] = {}
+    for key, recs in groups.items():
+        if not key.startswith("episode:") or len(recs) != 2:
+            continue
+        season_key = recs[0].season_key
+        if not season_key:
+            continue
+        hashes = {r.torrent_hash for r in recs if r.torrent_hash}
+        if len(hashes) != 1:
+            continue
+        h = next(iter(hashes))
+        side_a = [r for r in recs if r.torrent_hash == h]
+        side_b = [r for r in recs if r.torrent_hash != h]
+        if len(side_a) != 1 or len(side_b) != 1:
+            continue
+        buckets.setdefault((season_key, h), []).append((key, side_a[0], side_b[0]))
+
+    clusters = []
+    for (season_key, h), items in buckets.items():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda x: x[1].group_title)
+        clusters.append({"season_key": season_key, "hash": h, "items": items})
+    clusters.sort(key=lambda c: c["season_key"])
+    return clusters
+
+
+def render_season_cluster(cluster: dict):
+    season_key = cluster["season_key"]
+    items = cluster["items"]
+    show, _, season = season_key.partition("::")
+    sample_a, sample_b = items[0][1], items[0][2]
+    total_a = sum(a.size for _, a, _ in items)
+    total_b = sum(b.size for _, _, b in items)
+
+    console.print(Panel(
+        f"[bold]{show} — {season}[/bold]  ({len(items)} episodes share one torrent on one side)",
+        box=box.HEAVY, style="cyan",
+    ))
+
+    table = Table(box=box.SIMPLE_HEAVY)
+    for col in ("Side", "Res", "Source", "Video", "HDR/DV", "Audio", "Total Size", "Group", "Tracked", "Score", "Seeding"):
+        table.add_column(col)
+    table.add_row(
+        "A (torrent)", fmt_resolution(sample_a), fmt_source(sample_a), fmt_video_codec(sample_a),
+        fmt_hdr(sample_a), fmt_audio(sample_a), fmt_size(total_a), fmt_release_group(sample_a),
+        sample_a.tracked_by, fmt_score(sample_a), fmt_seeding(sample_a),
+    )
+    table.add_row(
+        "B", fmt_resolution(sample_b), fmt_source(sample_b), fmt_video_codec(sample_b),
+        fmt_hdr(sample_b), fmt_audio(sample_b), fmt_size(total_b), fmt_release_group(sample_b),
+        sample_b.tracked_by, fmt_score(sample_b), fmt_seeding(sample_b),
+    )
+    console.print(table)
+    for _, a, _b in items:
+        console.print(f"  [dim]{a.group_title}[/dim]")
+    console.print("  [dim]Side A and B shown from episode 1 as representative — per-episode quality can vary slightly within a season pack.[/dim]\n")
+
+
 def main():
     report_only = "--report-only" in sys.argv
     reset = "--reset" in sys.argv
@@ -608,8 +732,8 @@ def main():
         t1 = progress.add_task("Scanning Plex library...", total=None)
         radarr_idx = load_radarr_index()
         sonarr_idx = load_sonarr_index(progress, progress.add_task("Indexing Sonarr episode files...", total=None))
-        qbit_paths = load_qbit_active_paths()
-        groups = build_groups(radarr_idx, sonarr_idx, qbit_paths, progress, t1)
+        qbit_index = load_qbit_index()
+        groups = build_groups(radarr_idx, sonarr_idx, qbit_index, progress, t1)
 
     console.print(f"\n[bold]{len(groups)}[/bold] titles have more than one version in your library.\n")
 
@@ -625,9 +749,64 @@ def main():
         console.print(f"  [dim]{len(done)} already reviewed in a previous session (resuming) — pass --reset to start over[/dim]")
     console.print()
 
+    quit_requested = False
+
+    # --- Season batches first: episodes sharing one torrent on one side get one decision ---
+    clusters = build_season_clusters(groups)
+    clusters = [c for c in clusters if not all(k in done for k, _, _ in c["items"])]
+    if clusters and not report_only:
+        console.print(f"[bold]{len(clusters)}[/bold] season batch(es) detected — review these first, then individual titles.\n")
+
+    for cluster in clusters:
+        keys = [k for k, _, _ in cluster["items"]]
+        render_season_cluster(cluster)
+
+        if report_only:
+            done.update(keys)
+            continue
+
+        while True:
+            choice = Prompt.ask(
+                f"[bold]Keep[/bold] side A or B for all {len(cluster['items'])} episodes? 'a'/'b', 'i'=review individually, 'q'=quit"
+            ).strip().lower()
+            console.print(f"  [dim](received: {choice!r})[/dim]")
+            if choice:
+                break
+            console.print("  [red]No input received.[/red]")
+
+        if choice == "q":
+            save_state(done)
+            quit_requested = True
+            break
+
+        if choice == "i":
+            console.print("  [dim]→ Will review these episodes individually below.[/dim]\n")
+            continue
+
+        if choice not in ("a", "b"):
+            console.print(f"[red]'{choice}' isn't a valid choice — this batch will come up again next run.[/red]\n")
+            continue
+
+        cluster_failure = False
+        for key, side_a, side_b in cluster["items"]:
+            to_keep, to_delete = ([side_a], [side_b]) if choice == "a" else ([side_b], [side_a])
+            outcome = delete_one(to_delete[0], to_keep)
+            if outcome == "deleted":
+                total_deleted += 1
+                total_freed += to_delete[0].size
+                done.add(key)
+            elif outcome == "declined":
+                done.add(key)
+            else:
+                cluster_failure = True
+        save_state(done)
+        console.print(f"  [bold]→ Season batch done.[/bold]" + ("  [red](some files failed — those episodes will reappear next run)[/red]" if cluster_failure else "") + "\n")
+
     ordered_keys = sorted(groups.keys(), key=lambda k: groups[k][0].group_title)
 
     for key in ordered_keys:
+        if quit_requested:
+            break
         if key in done:
             continue
         recs = groups[key]
@@ -675,24 +854,18 @@ def main():
         for rec in to_keep:
             console.print(f"    [green]✓ keep[/green]    {rec.path}")
 
+        had_failure = False
         for rec in to_delete:
-            if rec.actively_seeding and file_age_days(rec.path) < PROTECT_AGE_DAYS:
-                confirm = Prompt.ask(
-                    f"    [bold red]⚠ ACTIVE torrent, only {file_age_days(rec.path)}d old — deleting may trigger a hit-and-run.[/bold red] Delete anyway? [y/N]",
-                    default="n",
-                ).strip().lower()
-                if confirm != "y":
-                    console.print("    [yellow]Skipped that file.[/yellow]")
-                    continue
-            try:
-                os.remove(rec.path)
-                log(f"DELETED: {rec.path} (kept: {[r.path for r in to_keep]})")
-                console.print(f"    [green]Deleted.[/green]")
+            outcome = delete_one(rec, to_keep)
+            if outcome == "deleted":
                 total_deleted += 1
                 total_freed += rec.size
-            except OSError as e:
-                console.print(f"    [red]Failed to delete {rec.path}: {e}[/red]")
-                log(f"FAILED to delete {rec.path}: {e}")
+            elif outcome in ("unmapped", "error"):
+                had_failure = True
+
+        if had_failure:
+            console.print("  [red]Not marking this title reviewed — at least one delete failed, it will come up again next run.[/red]\n")
+            continue
 
         done.add(key)
         save_state(done)
