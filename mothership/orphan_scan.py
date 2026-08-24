@@ -169,9 +169,24 @@ def main():
         t3 = progress.add_task("Scanning disk for video files...", total=None)
         on_disk = scan_disk(progress, t3)
 
-    console.print(f"\nOn disk: [bold]{len(on_disk)}[/bold]  Plex-known: [bold]{len(plex_known)}[/bold]  qBittorrent-known: [bold]{len(qbit_known)}[/bold]\n")
+    not_in_plex = {p: v for p, v in on_disk.items() if p not in plex_known}
+    orphans = {p: v for p, v in not_in_plex.items() if p not in qbit_known}
 
-    orphans = {p: v for p, v in on_disk.items() if p not in plex_known and p not in qbit_known}
+    console.print(f"\nOn disk: [bold]{len(on_disk)}[/bold]  Plex-known: [bold]{len(plex_known)}[/bold]  qBittorrent-known: [bold]{len(qbit_known)}[/bold]")
+    # The raw counts above don't subtract cleanly into a meaningful number — Plex's own
+    # known-set can contain stale entries for files no longer on disk, which masks the real
+    # gap. Spell out the actual breakdown instead of leaving it to be inferred (wrongly) from
+    # the three totals: a user comparing 14834 vs 14832 above once read that as "2 files
+    # unaccounted for" when the real number of on-disk-but-not-in-Plex files was 26, all of
+    # them still claimed by qBittorrent and therefore correctly not orphans.
+    if not_in_plex:
+        console.print(
+            f"{len(not_in_plex)} file(s) on disk aren't in Plex yet — "
+            f"{len(not_in_plex) - len(orphans)} of those are still claimed by qBittorrent "
+            f"(not orphans), {len(orphans)} genuinely unclaimed by either.\n"
+        )
+    else:
+        console.print()
 
     if not orphans:
         console.print("[green]No orphaned files found.[/green]")
