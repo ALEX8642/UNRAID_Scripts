@@ -386,18 +386,35 @@ def load_qbit_index() -> dict:
     index = {}
     for t in r.json():
         cp = (t.get("content_path", "") or "").rstrip("/")
-        if not cp or cp in degenerate:
-            # A torrent with content_path exactly "/tv" (no specific file) — not a real path.
-            # Without this guard, to_host_path() leaves it unconverted, and the "is under this
-            # path" check below would then match every single file in that library as
-            # actively-seeding.
+        h = t.get("hash", "")
+        if not cp:
             continue
-        host_path, mapped = to_host_path(cp)
+        if cp not in degenerate:
+            host_path, mapped = to_host_path(cp)
+            if mapped:
+                # Same caution as FileRecord.path_mapped: an unrecognized mount is not
+                # something to guess about, so don't let it participate in the match.
+                index[host_path] = h
+            continue
+        # content_path is exactly a bare category root ("/tv", "/movies", ...). This could be
+        # a genuinely broken/placeholder torrent entry with no real content (the original
+        # reason for this check — without it, to_host_path() would leave it unconverted and
+        # the prefix match below would then match every file in the library as actively
+        # seeding), OR it could be a legitimate multi-file torrent with "Keep top level
+        # folder" disabled in qBittorrent, whose real files sit directly under that root.
+        # content_path alone can't distinguish those, and skipping unconditionally would
+        # silently strip hit-and-run protection from every file in a torrent of the second
+        # kind. Fetch its actual file list instead and index each file individually — a
+        # precise per-file path can't cause the "matches everything" problem the way the bare
+        # folder string would.
+        save_path, mapped = to_host_path((t.get("save_path", "") or "").rstrip("/"))
         if not mapped:
-            # Same caution as FileRecord.path_mapped: an unrecognized mount is not something
-            # to guess about, so don't let it participate in the seeding/torrent-hash match.
             continue
-        index[host_path] = t.get("hash", "")
+        rr = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
+        if not rr.ok:
+            continue
+        for f in rr.json():
+            index[os.path.join(save_path, f["name"])] = h
     return index
 
 
