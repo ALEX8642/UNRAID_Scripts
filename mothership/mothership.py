@@ -85,16 +85,39 @@ def call_module_main(module_name: str, argv: list[str]):
 
 
 def dupe_review_flow():
-    console.print(Panel("[bold]Quality-Based Duplicate Review[/bold]\nInteractive — every title needs your explicit choice.", style="magenta"))
+    console.print(Panel(
+        "[bold]Quality-Based Duplicate Review[/bold]\n"
+        "Finds titles that exist as more than one genuinely different file (different "
+        "resolution/source/encode) and helps you pick which to keep.",
+        style="magenta",
+    ))
     argv = []
-    if Confirm.ask("Preview only (--report-only, no prompts, nothing deleted)?", default=False):
+    if Confirm.ask(
+        "\nJust show a report of what it finds, without touching anything or asking about "
+        "each title? (Answer 'n' to instead go through titles one at a time and decide what "
+        "to keep)",
+        default=False,
+    ):
         argv.append("--report-only")
     else:
-        if Confirm.ask("Soft-delete to logs/trash/ instead of removing outright (--trash)?", default=False):
+        if Confirm.ask(
+            "\nWhen you choose to delete a file, move it to logs/trash/ instead of deleting "
+            "it outright, so you can still recover it if you change your mind?",
+            default=False,
+        ):
             argv.append("--trash")
-        if Confirm.ask("Ask Radarr/Sonarr to re-import a kept loose file (--reconcile)? Leave off if you rely on stale records to stop re-grabs.", default=False):
+        if Confirm.ask(
+            "\nAfter you keep a file, also ask Radarr/Sonarr to re-import it so it's tracked "
+            "again? (Leave this off if you're relying on the old, untracked record to stop "
+            "an automatic re-download)",
+            default=False,
+        ):
             argv.append("--reconcile")
-    if Confirm.ask("Start fresh, ignoring previously-reviewed titles (--reset)?", default=False):
+    if Confirm.ask(
+        "\nThis tool remembers titles you've already decided on and normally only shows you "
+        "new ones. Re-check everything from scratch, including titles already reviewed?",
+        default=False,
+    ):
         argv.append("--reset")
     call_module_main("dupe_review", argv)
 
