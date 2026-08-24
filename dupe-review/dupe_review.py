@@ -61,6 +61,11 @@ PATH_MAP = [
 
 LOGFILE = "/logs/dupe-review.log"
 STATE_FILE = "/logs/dupe-review-state.json"
+
+# Only require an extra confirmation before deleting an actively-seeding file if it's younger
+# than this — matches dedupe-library.sh's PROTECT_AGE_DAYS. Anything older is well past any
+# realistic hit-and-run window, so it deletes with no extra prompt.
+PROTECT_AGE_DAYS = 30
 # ==== END CONFIG ====
 
 console = Console()
@@ -205,7 +210,11 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
             group_kind=kind,
             media_item_id=r["media_item_id"],
             metadata_item_id=r["metadata_item_id"],
-            path=r["file"],
+            # Plex stores paths using its own container convention (e.g. "/tv/Show.mkv").
+            # Convert to the real host path immediately — this is the path actually used for
+            # deletion, mtime checks, and display, so there is exactly one source of truth
+            # rather than a raw Plex path that quietly never gets translated before os.remove().
+            path=to_host_path(r["file"]),
             size=r["size"] or 0,
             width=r["width"] or 0,
             height=r["height"] or 0,
@@ -314,9 +323,16 @@ def load_qbit_active_paths() -> set:
         return set()
     r = s.get(f"{QBIT_URL}/api/v2/torrents/info", timeout=30)
     r.raise_for_status()
+    degenerate = {prefix.rstrip("/") for prefix, _ in PATH_MAP}
     paths = set()
     for t in r.json():
-        cp = t.get("content_path", "")
+        cp = (t.get("content_path", "") or "").rstrip("/")
+        if not cp or cp in degenerate:
+            # A torrent with content_path exactly "/tv" (no specific file) — not a real path.
+            # Without this guard, to_host_path() leaves it unconverted, and the "is under this
+            # path" check below would then match every single file in that library as
+            # actively-seeding.
+            continue
         paths.add(to_host_path(cp))
     return paths
 
@@ -326,6 +342,14 @@ def is_actively_seeding(path: str, qbit_paths: set) -> bool:
         if path == p or path.startswith(p + "/"):
             return True
     return False
+
+
+def file_age_days(path: str) -> int:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return 0
+    return int((time.time() - mtime) / 86400)
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +462,15 @@ def fmt_score(rec: FileRecord) -> str:
     return f"[{color}]{rec.custom_format_score}[/{color}]"
 
 
+def fmt_seeding(rec: FileRecord) -> str:
+    if not rec.actively_seeding:
+        return ""
+    age = file_age_days(rec.path)
+    if age < PROTECT_AGE_DAYS:
+        return f"[bold red]ACTIVE ({age}d)[/bold red]"
+    return f"[dim]active, {age}d — past HNR window[/dim]"
+
+
 def fmt_runtime(rec: FileRecord) -> str:
     if not rec.duration_ms:
         return "?"
@@ -531,7 +564,7 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
             fmt_release_group(rec),
             rec.tracked_by,
             fmt_score(rec),
-            "[bold red]ACTIVE[/bold red]" if rec.actively_seeding else "",
+            fmt_seeding(rec),
             style=row_style,
         )
     console.print(table)
@@ -605,42 +638,60 @@ def main():
             done.add(key)
             continue
 
-        choice = Prompt.ask(
-            f"Keep which? (1-{len(recs)}, comma-separated for several, 'b'=keep both/all, 's'=skip for now, 'q'=quit)",
-            default="s",
-        )
-        if choice.lower() == "q":
+        while True:
+            choice = Prompt.ask(
+                f"[bold]Delete[/bold] which number(s)? e.g. '1' or '1,3'  —  'k'=keep all, 'q'=quit"
+            ).strip().lower()
+            console.print(f"  [dim](received: {choice!r})[/dim]")
+            if choice:
+                break
+            console.print("  [red]No input received — type 'k' to keep all, or a number to delete.[/red]")
+
+        if choice == "q":
             save_state(done)
             break
-        if choice.lower() in ("b", "s"):
+
+        if choice == "k":
             done.add(key)
             kept_all += 1
             save_state(done)
-            console.print()
+            console.print("  [dim]→ Kept all — nothing deleted for this title.[/dim]\n")
             continue
 
         try:
-            keep_indices = {int(x.strip()) - 1 for x in choice.split(",") if x.strip()}
+            delete_indices = {int(x.strip()) - 1 for x in choice.split(",") if x.strip()}
+            if not delete_indices or any(i < 0 or i >= len(recs) for i in delete_indices):
+                raise ValueError
         except ValueError:
-            console.print("[red]Couldn't parse that — skipping this group for now.[/red]\n")
+            console.print(f"[red]'{choice}' isn't a valid number 1-{len(recs)} — nothing changed, this title will come up again next run.[/red]\n")
             continue
 
-        to_delete = [r for i, r in enumerate(recs) if i not in keep_indices]
+        to_delete = [recs[i] for i in sorted(delete_indices)]
+        to_keep = [r for i, r in enumerate(recs) if i not in delete_indices]
+
+        console.print(f"  [bold]→ Deleting {len(to_delete)}, keeping {len(to_keep)}:[/bold]")
         for rec in to_delete:
-            if rec.actively_seeding:
-                console.print(f"[bold red]⚠ {rec.path} is an ACTIVE qBittorrent torrent right now.[/bold red]")
-                confirm = Prompt.ask("Deleting it will likely trigger a hit-and-run. Type DELETE to proceed anyway, or anything else to skip this file", default="")
-                if confirm != "DELETE":
-                    console.print("[yellow]Skipped.[/yellow]")
+            console.print(f"    [red]✗ delete[/red]  {rec.path}")
+        for rec in to_keep:
+            console.print(f"    [green]✓ keep[/green]    {rec.path}")
+
+        for rec in to_delete:
+            if rec.actively_seeding and file_age_days(rec.path) < PROTECT_AGE_DAYS:
+                confirm = Prompt.ask(
+                    f"    [bold red]⚠ ACTIVE torrent, only {file_age_days(rec.path)}d old — deleting may trigger a hit-and-run.[/bold red] Delete anyway? [y/N]",
+                    default="n",
+                ).strip().lower()
+                if confirm != "y":
+                    console.print("    [yellow]Skipped that file.[/yellow]")
                     continue
             try:
                 os.remove(rec.path)
-                log(f"DELETED: {rec.path} (kept: {[recs[i].path for i in keep_indices]})")
-                console.print(f"[green]Deleted:[/green] {rec.path}")
+                log(f"DELETED: {rec.path} (kept: {[r.path for r in to_keep]})")
+                console.print(f"    [green]Deleted.[/green]")
                 total_deleted += 1
                 total_freed += rec.size
             except OSError as e:
-                console.print(f"[red]Failed to delete {rec.path}: {e}[/red]")
+                console.print(f"    [red]Failed to delete {rec.path}: {e}[/red]")
                 log(f"FAILED to delete {rec.path}: {e}")
 
         done.add(key)
