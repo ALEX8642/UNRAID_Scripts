@@ -39,19 +39,13 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich import box
 
+from common import PATH_MAP, to_host_path
+
 # ==== CONFIG — non-secret settings, edit directly for your setup ====
 PLEX_DB = (
     "/plexdata/Plex Media Server/Plug-in Support/Databases/"
     "com.plexapp.plugins.library.db"
 )
-
-# Container-path -> host-path prefixes, same mapping used by dedupe-library.sh
-PATH_MAP = [
-    ("/movies/", "/mnt/user/Media/Movies/"),
-    ("/tv/", "/mnt/user/Media/tv/"),
-    ("/arr/movies/", "/mnt/user/Media/arr/movies/"),
-    ("/arr/shows/", "/mnt/user/Media/arr/shows/"),
-]
 
 # Plex library_sections.id for the Movies/TV libraries Radarr/Sonarr manage — i.e. the ones
 # PATH_MAP actually covers. Plex's "movie" metadata_type also covers other section types (Home
@@ -89,21 +83,6 @@ PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 # ==== END CONFIG ====
 
 console = Console()
-
-
-def to_host_path(p: str) -> tuple[str, bool]:
-    """Returns (converted_path, whether a PATH_MAP prefix actually matched)."""
-    # Match with or without a trailing slash — a bare category path (e.g. exactly "/movies",
-    # no trailing slash, as qBittorrent reports a multi-file torrent's save_path) must still
-    # convert. Matching only the slash-terminated form silently failed to convert it; found as
-    # a real bug in orphan-scan.py's copy of this same function, via a hit-and-run near-miss.
-    for prefix, host in PATH_MAP:
-        bare = prefix.rstrip("/")
-        if p == bare:
-            return host.rstrip("/"), True
-        if p.startswith(prefix):
-            return host + p[len(prefix):], True
-    return p, False
 
 
 def to_container_variants(host_path: str) -> list[str]:

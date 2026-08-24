@@ -26,6 +26,8 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich import box
 
+from common import to_host_path
+
 # ==== CONFIG — non-secret settings, edit directly for your setup ====
 PLEX_DB = (
     "/plexdata/Plex Media Server/Plug-in Support/Databases/"
@@ -34,14 +36,6 @@ PLEX_DB = (
 
 MOVIES_HOST_ROOT = "/mnt/user/Media/Movies"
 TV_HOST_ROOT = "/mnt/user/Media/tv"
-
-# Container-path -> host-path prefixes, same mapping used by dedupe-library.sh / dupe-review.
-PATH_MAP = [
-    ("/movies/", "/mnt/user/Media/Movies/"),
-    ("/tv/", "/mnt/user/Media/tv/"),
-    ("/arr/movies/", "/mnt/user/Media/arr/movies/"),
-    ("/arr/shows/", "/mnt/user/Media/arr/shows/"),
-]
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".iso", ".m4v", ".wmv"}
 MIN_SIZE_BYTES = 10_000_000  # 10MB floor — excludes stray thumbnail/artifact files, not samples
@@ -57,22 +51,6 @@ QBIT_PASS = os.environ.get("QBIT_PASS", "")
 # ==== END CONFIG ====
 
 console = Console()
-
-
-def to_host_path(p: str) -> str:
-    # Match against the prefix with or without a trailing slash: a torrent's bare category
-    # save_path (e.g. exactly "/movies", no trailing slash) must convert the same as a full
-    # path under it — matching only the slash-terminated form silently failed to convert it,
-    # leaving every per-file path built from that save_path un-converted and never matching a
-    # real on-disk host path (found via a real hit-and-run near-miss: two actively-seeding
-    # multi-file torrents' nested files were wrongly flagged as orphaned because of this).
-    for prefix, host in PATH_MAP:
-        bare = prefix.rstrip("/")
-        if p == bare:
-            return host.rstrip("/")
-        if p.startswith(prefix):
-            return host + p[len(prefix):]
-    return p
 
 
 def log(msg: str):
@@ -112,7 +90,13 @@ def load_plex_known() -> set:
     con.text_factory = lambda b: b.decode("utf-8", errors="replace")
     cur = con.cursor()
     cur.execute("SELECT file FROM media_parts")
-    known = {to_host_path(row[0]) for row in cur.fetchall() if row[0]}
+    known = set()
+    for row in cur.fetchall():
+        if not row[0]:
+            continue
+        p, mapped = to_host_path(row[0])
+        if mapped:
+            known.add(p)
     con.close()
     return known
 
@@ -132,9 +116,12 @@ def load_qbit_known() -> set:
 
     known = set()
     for t in torrents:
-        cp = to_host_path((t.get("content_path", "") or "").rstrip("/"))
-        known.add(cp)
-        save_path = to_host_path((t.get("save_path", "") or "").rstrip("/"))
+        cp, cp_mapped = to_host_path((t.get("content_path", "") or "").rstrip("/"))
+        if cp_mapped:
+            known.add(cp)
+        save_path, sp_mapped = to_host_path((t.get("save_path", "") or "").rstrip("/"))
+        if not sp_mapped:
+            continue
         rr = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": t["hash"]}, timeout=30)
         if not rr.ok:
             continue
