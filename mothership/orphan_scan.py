@@ -175,7 +175,7 @@ def main():
 
     if not orphans:
         console.print("[green]No orphaned files found.[/green]")
-        return
+        return 0
 
     now = time.time()
     rows = sorted(orphans.items(), key=lambda kv: kv[1][0], reverse=True)
@@ -240,6 +240,8 @@ def main():
         log(f"Scan: {len(orphans)} candidates, {fmt_size(total_size)} total, {recent_count} flagged recent")
         for path, (size, mtime) in rows:
             log(f"CANDIDATE: {path} ({fmt_size(size)}, mtime age {(now - mtime) / 3600:.1f}h)")
+
+    return len(orphans)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ then a final sweep for anything left behind by either.
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -29,16 +30,34 @@ sys.path.insert(0, "/app")
 DEDUPE_SH = "/app/dedupe-library.sh"
 
 
-def run_dedupe_sh(apply: bool):
+def run_dedupe_sh(apply: bool) -> int:
+    """Runs dedupe-library.sh, streaming its output live (plain print, not console.print —
+    its lines start with a bracketed timestamp, which rich would otherwise try to parse as a
+    markup tag). Returns the total deleted/would-delete count parsed out of its per-library
+    summary lines, so the caller can skip asking to apply when nothing was actually found."""
     args = ["bash", DEDUPE_SH] + (["--apply"] if apply else [])
     console.print(Panel(f"[bold]dedupe-library.sh[/bold] — {'APPLY' if apply else 'dry run'}", style="cyan"))
-    subprocess.run(args, env=os.environ.copy())
+    total_found = 0
+    proc = subprocess.Popen(
+        args, env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+        m = re.search(r"summary: (\d+) deleted", line)
+        if m:
+            total_found += int(m.group(1))
+    proc.wait()
+    return total_found
 
 
 def dedupe_flow():
     console.print(Panel("[bold]Exact-Duplicate Cleanup[/bold]\nByte-identical loose-vs-sorted matches only. Always previews before deleting anything.", style="magenta"))
-    run_dedupe_sh(apply=False)
-    if Confirm.ask("\nApply these deletions now?", default=False):
+    found = run_dedupe_sh(apply=False)
+    if found == 0:
+        console.print("\n[green]Nothing to clean up — no exact duplicates found.[/green]")
+        return
+    if Confirm.ask(f"\n{found} duplicate(s) found — apply these deletions now?", default=False):
         run_dedupe_sh(apply=True)
         console.print("[dim]Remember: Plex needs a library scan + Empty Trash to stop showing these as duplicates (dupe-review's --reconcile aside, this tool doesn't touch Plex).[/dim]")
 
@@ -46,7 +65,9 @@ def dedupe_flow():
 def call_module_main(module_name: str, argv: list[str]):
     """Imports/reuses the module, temporarily swaps sys.argv, and calls its main() — catching
     SystemExit so a guard clause inside that tool (missing creds, qBittorrent down, etc.)
-    returns control to this menu instead of killing the whole mothership process."""
+    returns control to this menu instead of killing the whole mothership process. Returns
+    whatever that tool's main() returns (orphan_scan's does: the candidate count found),
+    or None if it exited early."""
     module = sys.modules.get(module_name)
     if module is None:
         import importlib
@@ -54,10 +75,11 @@ def call_module_main(module_name: str, argv: list[str]):
     old_argv = sys.argv
     sys.argv = [f"{module_name}.py"] + argv
     try:
-        module.main()
+        return module.main()
     except SystemExit as e:
         if e.code not in (0, None):
             console.print(f"[yellow]{module_name} exited early (code {e.code}) — see message above.[/yellow]")
+        return None
     finally:
         sys.argv = old_argv
 
@@ -78,14 +100,16 @@ def dupe_review_flow():
 
 
 def orphan_scan_flow():
-    console.print(Panel("[bold]Orphan File Scan[/bold]\nFiles claimed by neither Plex nor qBittorrent.", style="magenta"))
-    argv = []
-    if Confirm.ask("Apply deletions this run (default is report-only)?", default=False):
-        argv.append("--apply")
+    console.print(Panel("[bold]Orphan File Scan[/bold]\nFiles claimed by neither Plex nor qBittorrent. Always scans in report-only mode first.", style="magenta"))
+    found = call_module_main("orphan_scan", [])
+    if not found:
+        return
+    if Confirm.ask(f"\n{found} candidate(s) found — apply these deletions now?", default=False):
         extra = Prompt.ask("Any paths to exclude? (comma-separated, blank for none)", default="")
+        argv = ["--apply"]
         for p in [x.strip() for x in extra.split(",") if x.strip()]:
             argv += ["--exclude", p]
-    call_module_main("orphan_scan", argv)
+        call_module_main("orphan_scan", argv)
 
 
 def run_all():

@@ -63,6 +63,14 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
 }
 
+# Same as log(), but file-only — for the "nothing to see here" case that fires once per
+# loose file with no size match (the overwhelming majority on any real library run). Printing
+# every one of those to the console is just noise a human can't read at that speed; the full
+# detail still lands in $LOGFILE for anyone who actually needs to audit it.
+log_detail() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOGFILE"
+}
+
 # ---- qBittorrent: build an index of every active torrent's content path ----
 # Critical safety dependency: is_in_qbit() (the H&R guard) is only as good as this index.
 # A silent failure here (bad login, qBittorrent down) must never be mistaken for "nothing is
@@ -182,12 +190,20 @@ process_library() {
 
   [ -f "$WORKDIR/${kind}_loose.txt" ] || { log "--- $kind: nothing loose found, skipping ---"; return; }
 
+  local total_loose checked=0
+  total_loose=$(wc -l < "$WORKDIR/${kind}_loose.txt")
+  log "--- $kind: checking $total_loose loose file(s) against the sorted library (quiet unless something's actually found) ---"
+
   while IFS=$'\t' read -r size loosefile; do
+    checked=$((checked + 1))
+    if (( checked % 500 == 0 )); then
+      log "... $kind: checked $checked/$total_loose so far"
+    fi
     matches=$(awk -F'\t' -v sz="$size" '$1==sz {print $2}' "$WORKDIR/${kind}_sorted.txt" 2>/dev/null)
     match_count=$(printf '%s\n' "$matches" | grep -c . || true)
 
     if [ "$match_count" -ne 1 ]; then
-      log "SKIP (ambiguous, $match_count matches) $loosefile"
+      log_detail "SKIP (ambiguous, $match_count matches) $loosefile"
       skipped_ambiguous=$((skipped_ambiguous + 1))
       continue
     fi
