@@ -81,26 +81,50 @@ build_qbit_index() {
   torrents_json=$(curl -s -w '\n%{http_code}' -b "$cookie" "$QBIT_URL/api/v2/torrents/info")
   torrents_http=$(printf '%s' "$torrents_json" | tail -1)
   torrents_json=$(printf '%s' "$torrents_json" | sed '$d')
-  rm -f "$cookie"
   if [ "$torrents_http" != "200" ]; then
+    rm -f "$cookie"
     log "FATAL: qBittorrent torrents/info call failed (HTTP $torrents_http). Refusing to run without a working H&R safety check."
     exit 1
   fi
-  # Bare-path rules (no trailing slash) come first: qBittorrent reports a multi-file torrent's
-  # content_path as exactly "/movies" or "/tv" (no trailing slash) when "Keep top level folder"
-  # is off, and matching only the slash-terminated form silently drops that torrent from the
-  # H&R index entirely — confirmed against 8 real torrents (Vikings S01-S05, The Score,
-  # Marauders). Same failure mode as to_host_path() in common.py; fixed the same way here.
-  printf '%s' "$torrents_json" | jq -r '.[] | .content_path' \
-    | sed -e "s|^/movies\$|$MOVIES_HOST_ROOT|" \
-          -e "s|^/movies/|$MOVIES_HOST_ROOT/|" \
-          -e "s|^/tv\$|$TV_HOST_ROOT|" \
+
+  : > "$WORKDIR/qbit_paths.txt"
+
+  # Normal case: content_path has a real subpath under the category root — convert with the
+  # usual prefix rules, one line per torrent.
+  printf '%s' "$torrents_json" | jq -r '.[] | .content_path
+      | select(IN("/movies", "/tv", "/arr/movies", "/arr/shows") | not)' \
+    | sed -e "s|^/movies/|$MOVIES_HOST_ROOT/|" \
           -e "s|^/tv/|$TV_HOST_ROOT/|" \
-          -e "s|^/arr/movies\$|/mnt/user/Media/arr/movies|" \
           -e "s|^/arr/movies/|/mnt/user/Media/arr/movies/|" \
-          -e "s|^/arr/shows\$|/mnt/user/Media/arr/shows|" \
           -e "s|^/arr/shows/|/mnt/user/Media/arr/shows/|" \
-    > "$WORKDIR/qbit_paths.txt"
+    >> "$WORKDIR/qbit_paths.txt"
+
+  # Bare category-root case: qBittorrent reports content_path as exactly "/movies" or "/tv"
+  # (no trailing slash) when a multi-file torrent has "Keep top level folder" off — real files
+  # sit directly under that root. Converting the bare root itself (a single "$HOST_ROOT" line)
+  # would make is_in_qbit()'s prefix match treat EVERY file in that whole library as actively
+  # seeding, silently disabling the H&R guard's actual job (refusing to delete a genuine
+  # duplicate) for as long as any one such torrent is active — confirmed against 8 real
+  # torrents (Vikings S01-S05, The Score, Marauders). Fetch each one's real per-file list
+  # instead (same fix already used in dupe_review.py's load_qbit_index()) and emit one precise
+  # path per file — a stray backslash-separated sample-file name just becomes a dead, harmless
+  # entry that can't match a real on-disk path, same as in the Python version.
+  local hash cp host_root
+  while IFS=$'\t' read -r hash cp; do
+    case "$cp" in
+      /movies) host_root="$MOVIES_HOST_ROOT" ;;
+      /tv) host_root="$TV_HOST_ROOT" ;;
+      /arr/movies) host_root="/mnt/user/Media/arr/movies" ;;
+      /arr/shows) host_root="/mnt/user/Media/arr/shows" ;;
+      *) continue ;;
+    esac
+    curl -s -G -b "$cookie" --data-urlencode "hash=$hash" "$QBIT_URL/api/v2/torrents/files" \
+      | jq -r --arg root "$host_root" '.[] | "\($root)/\(.name)"' \
+      >> "$WORKDIR/qbit_paths.txt"
+  done < <(printf '%s' "$torrents_json" \
+    | jq -r '.[] | select(.content_path=="/movies" or .content_path=="/tv" or .content_path=="/arr/movies" or .content_path=="/arr/shows") | [.hash, .content_path] | @tsv')
+
+  rm -f "$cookie"
   if [ ! -s "$WORKDIR/qbit_paths.txt" ]; then
     log "FATAL: qBittorrent reports zero active torrents — that's almost certainly wrong for this library and would disable the H&R safety check for everything. Refusing to run."
     exit 1
