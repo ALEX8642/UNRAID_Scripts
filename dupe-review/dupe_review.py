@@ -93,7 +93,14 @@ console = Console()
 
 def to_host_path(p: str) -> tuple[str, bool]:
     """Returns (converted_path, whether a PATH_MAP prefix actually matched)."""
+    # Match with or without a trailing slash — a bare category path (e.g. exactly "/movies",
+    # no trailing slash, as qBittorrent reports a multi-file torrent's save_path) must still
+    # convert. Matching only the slash-terminated form silently failed to convert it; found as
+    # a real bug in orphan-scan.py's copy of this same function, via a hit-and-run near-miss.
     for prefix, host in PATH_MAP:
+        bare = prefix.rstrip("/")
+        if p == bare:
+            return host.rstrip("/"), True
         if p.startswith(prefix):
             return host + p[len(prefix):], True
     return p, False

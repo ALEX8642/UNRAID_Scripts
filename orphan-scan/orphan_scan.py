@@ -60,7 +60,16 @@ console = Console()
 
 
 def to_host_path(p: str) -> str:
+    # Match against the prefix with or without a trailing slash: a torrent's bare category
+    # save_path (e.g. exactly "/movies", no trailing slash) must convert the same as a full
+    # path under it — matching only the slash-terminated form silently failed to convert it,
+    # leaving every per-file path built from that save_path un-converted and never matching a
+    # real on-disk host path (found via a real hit-and-run near-miss: two actively-seeding
+    # multi-file torrents' nested files were wrongly flagged as orphaned because of this).
     for prefix, host in PATH_MAP:
+        bare = prefix.rstrip("/")
+        if p == bare:
+            return host.rstrip("/")
         if p.startswith(prefix):
             return host + p[len(prefix):]
     return p
