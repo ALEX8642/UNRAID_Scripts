@@ -19,9 +19,11 @@ This tool never deletes anything on its own. Every group requires an explicit in
 choice: keep one file, keep several, or keep all (do nothing).
 """
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -37,15 +39,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich import box
 
-# ==== CONFIG — edit these for your setup ====
-RADARR_URL = "http://localhost:7878"
-RADARR_KEY = "CHANGE_ME"
-SONARR_URL = "http://localhost:8989"
-SONARR_KEY = "CHANGE_ME"
-QBIT_URL = "http://localhost:8080"
-QBIT_USER = "admin"
-QBIT_PASS = "CHANGE_ME"
-
+# ==== CONFIG — non-secret settings, edit directly for your setup ====
 PLEX_DB = (
     "/plexdata/Plex Media Server/Plug-in Support/Databases/"
     "com.plexapp.plugins.library.db"
@@ -73,6 +67,25 @@ STATE_FILE = "/logs/dupe-review-state.json"
 # than this — matches dedupe-library.sh's PROTECT_AGE_DAYS. Anything older is well past any
 # realistic hit-and-run window, so it deletes with no extra prompt.
 PROTECT_AGE_DAYS = 30
+
+# Where soft-deleted files go when run with --trash instead of being removed outright. Not
+# auto-cleaned — that's a deliberate separate step, run your own cleanup on a schedule you trust.
+TRASH_DIR = "/logs/trash"
+# ==== END CONFIG ====
+
+# ==== CONFIG — credentials/connection info: set via a .env file (see .env.example), never
+# hardcode real values here — this file is committed to a public repo ====
+RADARR_URL = os.environ.get("RADARR_URL", "http://localhost:7878")
+RADARR_KEY = os.environ.get("RADARR_KEY", "")
+SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
+SONARR_KEY = os.environ.get("SONARR_KEY", "")
+QBIT_URL = os.environ.get("QBIT_URL", "http://localhost:8080")
+QBIT_USER = os.environ.get("QBIT_USER", "admin")
+QBIT_PASS = os.environ.get("QBIT_PASS", "")
+# Optional: Plex Settings -> Account, or find PlexOnlineToken in Preferences.xml. If unset, the
+# tool just reminds you to scan + empty trash yourself instead of doing it automatically.
+PLEX_URL = os.environ.get("PLEX_URL", "http://localhost:32400")
+PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 # ==== END CONFIG ====
 
 console = Console()
@@ -130,6 +143,7 @@ class FileRecord:
     path_mapped: bool = True  # False if no PATH_MAP prefix matched — deletion refused
     season_key: str = ""  # "<show>::S<NN>" for episodes, "" for movies — used to batch a season
     torrent_hash: str = ""  # qBittorrent hash this file belongs to, if any
+    arr_id: int = 0  # Radarr movieId / Sonarr seriesId, if tracked_by is Radarr/Sonarr
 
 
 def open_plex_db():
@@ -345,6 +359,7 @@ def enrich_with_arr(rec: FileRecord, radarr_idx: dict, sonarr_idx: dict):
     rec.custom_formats = [cf["name"] for cf in hit.get("customFormats", [])]
     rec.custom_format_score = hit.get("customFormatScore")
     rec.media_info = hit.get("mediaInfo") or {}
+    rec.arr_id = hit.get("movieId") or hit.get("seriesId") or 0
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +605,7 @@ def compute_highlights(recs: list[FileRecord]) -> dict:
 # ---------------------------------------------------------------------------
 
 def suggest_index(recs: list[FileRecord]) -> Optional[int]:
-    if durations_mismatch(recs):
+    if durations_mismatch(recs) or multi_part_mismatch(recs):
         return None
 
     def key(rec: FileRecord):
@@ -634,15 +649,37 @@ def durations_mismatch(recs: list[FileRecord]) -> bool:
     return (hi - lo) > 30_000 and (hi - lo) / hi > 0.10
 
 
-def render_group(console: Console, title: str, recs: list[FileRecord], suggested: Optional[int]):
+PART_PATTERN = re.compile(r"(?:disc|disk|part|cd)[\s._-]*([0-9]+)", re.IGNORECASE)
+
+
+def part_number(rec: FileRecord) -> Optional[int]:
+    m = PART_PATTERN.search(Path(rec.path).name)
+    return int(m.group(1)) if m else None
+
+
+def multi_part_mismatch(recs: list[FileRecord]) -> bool:
+    """True if filenames indicate different parts/discs of one release (e.g. Disc 1 vs Disc 2)
+    rather than alternate versions of the same content — Plex can group these under one title
+    since they share a title/year match despite being genuinely different content."""
+    parts = {part_number(r) for r in recs}
+    parts.discard(None)
+    return len(parts) > 1
+
+
+def render_group(console: Console, title: str, recs: list[FileRecord], suggested: Optional[int], position_label: str = ""):
     same_size = len({r.size for r in recs}) == 1
     mismatch = durations_mismatch(recs)
+    multi_part = multi_part_mismatch(recs)
     header = f"[bold]{title}[/bold]"
+    if position_label:
+        header = f"[dim]{position_label}[/dim]  " + header
     if mismatch:
         header += "\n[bold red]⚠ RUNTIMES DON'T MATCH — these are probably NOT the same content (Plex likely mis-grouped different files under one title). Verify manually before deleting anything.[/bold red]"
+    elif multi_part:
+        header += "\n[bold red]⚠ LOOKS LIKE DIFFERENT DISCS/PARTS OF ONE RELEASE (e.g. Disc 1 vs Disc 2) — NOT alternate versions of the same content. Verify manually before deleting anything.[/bold red]"
     elif same_size:
         header += "  [red]⚠ all files are the exact same size — likely a leftover exact duplicate, not a real quality choice[/red]"
-    style = "red" if mismatch else "cyan"
+    style = "red" if (mismatch or multi_part) else "cyan"
     console.print(Panel(header, box=box.HEAVY, style=style))
 
     table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
@@ -693,7 +730,8 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
     if suggested is not None:
         console.print(f"  [dim]★ suggested keep (based on Radarr/Sonarr score, then resolution, then HDR/DV, then size — advisory only)[/dim]")
     else:
-        console.print("  [dim]No suggestion offered — runtimes differ too much to treat these as comparable quality tiers.[/dim]")
+        why = "runtimes differ too much" if mismatch else "filenames look like different discs/parts" if multi_part else "not comparable"
+        console.print(f"  [dim]No suggestion offered — {why} to treat these as the same content.[/dim]")
     if any(h["audio"] or h["dv"] for h in highlights.values()):
         console.print("  [dim][bold green]green[/bold green] Audio/HDR-DV cell = notably better audio codec or a more broadly-supported DV profile (suppressed when a 4K Remux is in the group)[/dim]")
     console.print()
@@ -718,8 +756,109 @@ def save_state(done: set):
         json.dump(sorted(done), f)
 
 
-def delete_one(rec: FileRecord, to_keep: list[FileRecord]) -> str:
-    """Deletes rec.path, printing its own status line. Returns 'deleted', 'declined'
+def group_fingerprint(recs: list[FileRecord]) -> str:
+    sig = "|".join(sorted(f"{r.path}:{r.size}" for r in recs))
+    return hashlib.sha1(sig.encode()).hexdigest()[:12]
+
+
+def state_key(key: str, recs: list[FileRecord]) -> str:
+    # Tied to the specific file set (path+size), not just the title — if a new duplicate shows
+    # up for a title already marked reviewed (a re-grab, a manual add), the fingerprint changes
+    # and it resurfaces instead of staying silently marked done forever.
+    return f"{key}::{group_fingerprint(recs)}"
+
+
+def reconcile_arr(kept: FileRecord, deleted_tracked: FileRecord) -> None:
+    """Best-effort: when the file Radarr/Sonarr was tracking gets deleted in favor of a loose
+    one, that app now thinks the movie/episode is missing and may re-grab it. Ask it to
+    manually import the kept file instead, so it goes back to tracking a real file. Failures
+    here are logged and shown but never block the deletion that already happened."""
+    if not deleted_tracked.arr_id:
+        return
+    kind = deleted_tracked.group_kind
+    base_url = RADARR_URL if kind == "movie" else SONARR_URL
+    api_key = RADARR_KEY if kind == "movie" else SONARR_KEY
+    id_param = "movieId" if kind == "movie" else "seriesId"
+    folder = os.path.dirname(kept.path)
+    try:
+        r = requests.get(
+            f"{base_url}/api/v3/manualimport",
+            headers={"X-Api-Key": api_key},
+            params={"folder": folder, id_param: deleted_tracked.arr_id, "filterExistingFiles": "false"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        candidates = r.json()
+        if not isinstance(candidates, list):
+            # Radarr/Sonarr returns a {"message": ...} error object (not a list) for various
+            # failures — a stale movie/series record, a folder it can't read, etc.
+            msg = candidates.get("message", candidates) if isinstance(candidates, dict) else candidates
+            console.print(f"    [yellow]{deleted_tracked.tracked_by} manual-import lookup failed: {msg}. Check manually if this title shows as missing.[/yellow]")
+            log(f"RECONCILE FAILED (manualimport returned non-list) for {kept.path}: {msg}")
+            return
+    except requests.RequestException as e:
+        console.print(f"    [yellow]Couldn't ask {deleted_tracked.tracked_by} to re-import the kept file: {e}. Check it manually if this title shows as missing.[/yellow]")
+        log(f"RECONCILE FAILED (manualimport lookup) for {kept.path}: {e}")
+        return
+
+    match = next((c for c in candidates if c.get("path") == kept.path), None)
+    if not match or not match.get("quality") or match["quality"].get("quality", {}).get("id", 0) == 0:
+        console.print(f"    [yellow]{deleted_tracked.tracked_by} couldn't confidently parse the kept file for re-import — check manually if this title shows as missing.[/yellow]")
+        log(f"RECONCILE SKIPPED (no confident parse) for {kept.path}")
+        return
+
+    try:
+        r = requests.post(
+            f"{base_url}/api/v3/command",
+            headers={"X-Api-Key": api_key},
+            json={"name": "ManualImport", "files": [match], "importMode": "auto"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        console.print(f"    [green]Asked {deleted_tracked.tracked_by} to import the kept file so it's tracked again.[/green]")
+        log(f"RECONCILED: {kept.path} imported into {deleted_tracked.tracked_by} for {id_param}={deleted_tracked.arr_id}")
+    except requests.RequestException as e:
+        console.print(f"    [yellow]{deleted_tracked.tracked_by} import request failed: {e}. Check manually if this title shows as missing.[/yellow]")
+        log(f"RECONCILE FAILED (import command) for {kept.path}: {e}")
+
+
+def plex_refresh_and_empty_trash() -> None:
+    if not PLEX_TOKEN:
+        console.print("[dim]PLEX_TOKEN not set — skipping automatic Plex scan/empty-trash. Run a library scan + Empty Trash yourself.[/dim]")
+        return
+    console.print("[dim]Triggering Plex library refresh for Movies/TV...[/dim]")
+    ok = True
+    for section_id in PLEX_LIBRARY_SECTION_IDS:
+        try:
+            r = requests.get(f"{PLEX_URL}/library/sections/{section_id}/refresh", params={"X-Plex-Token": PLEX_TOKEN}, timeout=15)
+            if not r.ok:
+                console.print(f"[red]Plex refresh for section {section_id} returned HTTP {r.status_code} — check PLEX_URL/PLEX_TOKEN.[/red]")
+                ok = False
+        except requests.RequestException as e:
+            console.print(f"[red]Plex refresh failed for section {section_id}: {e}[/red]")
+            ok = False
+    console.print("[dim]Waiting for the scan before emptying trash (best-effort — rerun Empty Trash yourself if some duplicates linger)...[/dim]")
+    time.sleep(20)
+    for section_id in PLEX_LIBRARY_SECTION_IDS:
+        try:
+            r = requests.put(f"{PLEX_URL}/library/sections/{section_id}/emptyTrash", params={"X-Plex-Token": PLEX_TOKEN}, timeout=15)
+            if not r.ok:
+                console.print(f"[red]Plex empty-trash for section {section_id} returned HTTP {r.status_code}.[/red]")
+                ok = False
+        except requests.RequestException as e:
+            console.print(f"[red]Plex empty-trash failed for section {section_id}: {e}[/red]")
+            ok = False
+    if ok:
+        console.print("[green]Plex library refreshed and trash emptied for Movies/TV.[/green]")
+
+
+def trash_path_for(rec: FileRecord, run_stamp: str) -> str:
+    safe_name = rec.path.strip("/").replace("/", "__")
+    return os.path.join(TRASH_DIR, run_stamp, safe_name)
+
+
+def delete_one(rec: FileRecord, to_keep: list[FileRecord], use_trash: bool, run_stamp: str) -> str:
+    """Deletes (or trashes) rec.path, printing its own status line. Returns 'deleted', 'declined'
     (user chose not to touch an actively-seeding file), 'unmapped', or 'error'."""
     if not rec.path_mapped:
         console.print(f"    [red]Refusing to delete — path doesn't match any known host mount: {rec.path}[/red]")
@@ -733,9 +872,16 @@ def delete_one(rec: FileRecord, to_keep: list[FileRecord]) -> str:
             console.print("    [yellow]Skipped that file.[/yellow]")
             return "declined"
     try:
-        os.remove(rec.path)
-        log(f"DELETED: {rec.path} (kept: {[r.path for r in to_keep]})")
-        console.print(f"    [green]Deleted.[/green]")
+        if use_trash:
+            dest = trash_path_for(rec, run_stamp)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.move(rec.path, dest)
+            log(f"TRASHED: {rec.path} -> {dest} (kept: {[r.path for r in to_keep]})")
+            console.print(f"    [green]Moved to trash:[/green] {dest}")
+        else:
+            os.remove(rec.path)
+            log(f"DELETED: {rec.path} (kept: {[r.path for r in to_keep]})")
+            console.print(f"    [green]Deleted.[/green]")
         return "deleted"
     except OSError as e:
         console.print(f"    [red]Failed to delete {rec.path}: {e}[/red]")
@@ -777,7 +923,7 @@ def build_season_clusters(groups: dict) -> list[dict]:
     return clusters
 
 
-def render_season_cluster(cluster: dict):
+def render_season_cluster(cluster: dict, position_label: str = ""):
     season_key = cluster["season_key"]
     items = cluster["items"]
     show, _, season = season_key.partition("::")
@@ -785,10 +931,10 @@ def render_season_cluster(cluster: dict):
     total_a = sum(a.size for _, a, _ in items)
     total_b = sum(b.size for _, _, b in items)
 
-    console.print(Panel(
-        f"[bold]{show} — {season}[/bold]  ({len(items)} episodes share one torrent on one side)",
-        box=box.HEAVY, style="cyan",
-    ))
+    header = f"[bold]{show} — {season}[/bold]  ({len(items)} episodes share one torrent on one side)"
+    if position_label:
+        header = f"[dim]{position_label}[/dim]  " + header
+    console.print(Panel(header, box=box.HEAVY, style="cyan"))
 
     highlights = compute_highlights([sample_a, sample_b])
     hdr_a = fmt_hdr(sample_a)
@@ -829,6 +975,13 @@ def render_season_cluster(cluster: dict):
 def main():
     report_only = "--report-only" in sys.argv
     reset = "--reset" in sys.argv
+    use_trash = "--trash" in sys.argv
+
+    missing = [n for n, v in [("RADARR_KEY", RADARR_KEY), ("SONARR_KEY", SONARR_KEY), ("QBIT_PASS", QBIT_PASS)] if not v]
+    if missing:
+        console.print(f"[bold red]Missing required credentials:[/bold red] {', '.join(missing)}")
+        console.print("Copy .env.example to .env in this directory, fill them in, then run via ./run.sh")
+        sys.exit(1)
 
     console.print(Panel("[bold]Plex Library Duplicate Review[/bold]\nFuzzy/quality duplicates — not exact-match dupes (those are handled by dedupe-library.sh)", style="magenta"))
 
@@ -843,11 +996,14 @@ def main():
         groups = build_groups(radarr_idx, sonarr_idx, qbit_index, progress, t1)
 
     console.print(f"\n[bold]{len(groups)}[/bold] titles have more than one version in your library.\n")
+    if use_trash:
+        console.print(f"[dim]--trash active: deletions move to {TRASH_DIR}/<run> instead of being removed outright. Not auto-cleaned — that's on you.[/dim]\n")
 
     done = set() if reset else load_state()
     total_freed = 0
     total_deleted = 0
     kept_all = 0
+    run_stamp = time.strftime("%Y%m%d-%H%M%S")
 
     movie_groups = {k: v for k, v in groups.items() if k.startswith("movie:")}
     ep_groups = {k: v for k, v in groups.items() if k.startswith("episode:")}
@@ -858,18 +1014,25 @@ def main():
 
     quit_requested = False
 
+    def maybe_reconcile(to_keep: list[FileRecord], to_delete_rec: FileRecord):
+        if len(to_keep) != 1 or to_delete_rec.tracked_by not in ("Radarr", "Sonarr"):
+            return
+        if to_keep[0].tracked_by in ("Radarr", "Sonarr"):
+            return  # kept file is itself tracked — nothing orphaned
+        reconcile_arr(to_keep[0], to_delete_rec)
+
     # --- Season batches first: episodes sharing one torrent on one side get one decision ---
     clusters = build_season_clusters(groups)
-    clusters = [c for c in clusters if not all(k in done for k, _, _ in c["items"])]
+    clusters = [c for c in clusters if not all(state_key(k, [a, b]) in done for k, a, b in c["items"])]
     if clusters and not report_only:
         console.print(f"[bold]{len(clusters)}[/bold] season batch(es) detected — review these first, then individual titles.\n")
 
-    for cluster in clusters:
-        keys = [k for k, _, _ in cluster["items"]]
-        render_season_cluster(cluster)
+    for idx, cluster in enumerate(clusters, start=1):
+        render_season_cluster(cluster, position_label=f"[Batch {idx}/{len(clusters)}]")
 
         if report_only:
-            done.update(keys)
+            for k, a, b in cluster["items"]:
+                done.add(state_key(k, [a, b]))
             continue
 
         while True:
@@ -896,20 +1059,22 @@ def main():
 
         cluster_failure = False
         for key, side_a, side_b in cluster["items"]:
-            if key in done:
+            sk = state_key(key, [side_a, side_b])
+            if sk in done:
                 # Already resolved — e.g. handled individually in a prior run after picking
                 # 'i' on this same cluster, or already deleted before an earlier quit. Without
                 # this, re-picking 'a'/'b' would re-attempt os.remove() on an already-deleted
                 # file and log a spurious failure for an episode that's actually fine.
                 continue
             to_keep, to_delete = ([side_a], [side_b]) if choice == "a" else ([side_b], [side_a])
-            outcome = delete_one(to_delete[0], to_keep)
+            outcome = delete_one(to_delete[0], to_keep, use_trash, run_stamp)
             if outcome == "deleted":
                 total_deleted += 1
                 total_freed += to_delete[0].size
-                done.add(key)
+                done.add(sk)
+                maybe_reconcile(to_keep, to_delete[0])
             elif outcome == "declined":
-                done.add(key)
+                done.add(sk)
             else:
                 cluster_failure = True
         save_state(done)
@@ -917,17 +1082,18 @@ def main():
 
     ordered_keys = sorted(groups.keys(), key=lambda k: groups[k][0].group_title)
 
-    for key in ordered_keys:
+    for idx, key in enumerate(ordered_keys, start=1):
         if quit_requested:
             break
-        if key in done:
-            continue
         recs = groups[key]
+        sk = state_key(key, recs)
+        if sk in done:
+            continue
         suggested = suggest_index(recs)
-        render_group(console, recs[0].group_title, recs, suggested)
+        render_group(console, recs[0].group_title, recs, suggested, position_label=f"[Title {idx}/{len(ordered_keys)}]")
 
         if report_only:
-            done.add(key)
+            done.add(sk)
             continue
 
         while True:
@@ -944,7 +1110,7 @@ def main():
             break
 
         if choice == "a":
-            done.add(key)
+            done.add(sk)
             kept_all += 1
             save_state(done)
             console.print("  [dim]→ Kept all — nothing deleted for this title.[/dim]\n")
@@ -969,10 +1135,11 @@ def main():
 
         had_failure = False
         for rec in to_delete:
-            outcome = delete_one(rec, to_keep)
+            outcome = delete_one(rec, to_keep, use_trash, run_stamp)
             if outcome == "deleted":
                 total_deleted += 1
                 total_freed += rec.size
+                maybe_reconcile(to_keep, rec)
             elif outcome in ("unmapped", "error"):
                 had_failure = True
 
@@ -980,14 +1147,18 @@ def main():
             console.print("  [red]Not marking this title reviewed — at least one delete failed, it will come up again next run.[/red]\n")
             continue
 
-        done.add(key)
+        done.add(sk)
         save_state(done)
         console.print()
+
+    if not report_only and total_deleted > 0:
+        console.print()
+        plex_refresh_and_empty_trash()
 
     console.print(Panel(
         f"Deleted: {total_deleted} files, freed {fmt_size(total_freed)}\n"
         f"Kept-both/skipped: {kept_all}\n\n"
-        f"[bold]Remember:[/bold] run a Plex library scan + Empty Trash to stop these from showing as duplicate versions.",
+        + ("[bold]Remember:[/bold] run a Plex library scan + Empty Trash to stop these from showing as duplicate versions." if not PLEX_TOKEN or report_only or total_deleted == 0 else "Plex was refreshed automatically above."),
         title="Session summary", style="cyan",
     ))
 

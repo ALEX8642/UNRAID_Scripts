@@ -175,17 +175,34 @@ side-by-side comparison and asks what to keep.
 - **Never deletes automatically.** Every group requires a typed choice — keep one, keep
   several, or keep all (skip). `--report-only` previews every group with no prompts and no
   deletions, useful for a first look or for re-testing after a config change.
-- Progress bars while it scans Plex + cross-references Radarr/Sonarr/qBittorrent; resumable
-  (remembers which titles you've already decided on across runs, `--reset` to start over).
+- **Season batching**: when every episode in a season has one side sharing the same
+  qBittorrent torrent (a season-pack grab vs. the individually Sonarr-managed copies), review
+  the whole season as one decision instead of once per episode.
+- **Green-highlights** a file with meaningfully better audio (lossless over lossy) or a more
+  broadly device-compatible Dolby Vision profile — suppressed whenever a 4K Remux is in the
+  group, so device-compatibility nuance never visually outweighs a top-tier remux.
+- **Multi-part guard**: filenames indicating different discs/parts of one release (Disc 1 vs
+  Disc 2, CD1/CD2) are flagged as NOT the same content and never get an auto-suggestion.
+- **Optional `--trash`**: moves deletions into `logs/trash/<run>/` instead of removing them
+  outright, for an undo window. Not auto-cleaned — that's a separate, deliberate step.
+- **Best-effort Radarr/Sonarr reconciliation**: if you keep the loose file over the one
+  Radarr/Sonarr was tracking, it asks that app to manually import the kept file so it's tracked
+  again instead of silently thinking the title is missing (and possibly re-grabbing it).
+- **Optional automatic Plex refresh + Empty Trash** at the end of a session that deleted
+  anything, if `PLEX_TOKEN` is set — otherwise just reminds you to do it manually.
+- Progress counter (`[Title 42/335]`) and progress bars while scanning; resumable — a title's
+  "reviewed" state is tied to its specific file set (path+size), so if a new duplicate shows up
+  for a title you already decided on, it resurfaces instead of staying silently skipped.
 
-> 📂 Script path: `dupe-review/` (Dockerfile + `dupe_review.py` + `run.sh`)  
+> 📂 Script path: `dupe-review/` (Dockerfile + `dupe_review.py` + `run.sh` + `.env.example`)  
 > 🕒 Recommended: Run after the exact-size dedupe script, as a periodic cleanup pass  
 > ⚙️ Requires: Docker (builds a small `python:3.12-slim` image with `rich`+`requests`, run with
 > `--network host` so it can reach Radarr/Sonarr/qBittorrent on `localhost`); a read-only bind
-> mount of Plex's `Plug-in Support/Databases` folder. Edit the CONFIG block at the top of
-> `dupe_review.py` with your own API keys/credentials before running — ship it with
-> placeholders, not real secrets. Run via `./run.sh` (add `--report-only` to preview without
-> prompts).
+> mount of Plex's `Plug-in Support/Databases` folder, and a read-write mount of your media root
+> (needed to actually delete/trash files). Copy `.env.example` to `.env` in the same directory
+> and fill in your Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN`) —
+> `.env` is gitignored, never commit real values. Run via `./run.sh` (add `--report-only` to
+> preview without prompts, `--trash` for soft-delete, `--reset` to re-review everything).
 
 ---
 **Example Script Description (for Unraid UI):**
