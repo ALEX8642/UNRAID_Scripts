@@ -78,11 +78,12 @@ PROTECT_AGE_DAYS = 30
 console = Console()
 
 
-def to_host_path(p: str) -> str:
+def to_host_path(p: str) -> tuple[str, bool]:
+    """Returns (converted_path, whether a PATH_MAP prefix actually matched)."""
     for prefix, host in PATH_MAP:
         if p.startswith(prefix):
-            return host + p[len(prefix):]
-    return p
+            return host + p[len(prefix):], True
+    return p, False
 
 
 def to_container_variants(host_path: str) -> list[str]:
@@ -136,10 +137,25 @@ def open_plex_db():
     return sqlite3.connect(uri, uri=True)
 
 
+def validate_library_sections(cur) -> None:
+    cur.execute("SELECT id, name, section_type FROM library_sections")
+    all_sections = cur.fetchall()
+    valid_ids = {row["id"] for row in all_sections}
+    missing = [i for i in PLEX_LIBRARY_SECTION_IDS if i not in valid_ids]
+    if not missing:
+        return
+    console.print(f"[bold red]WARNING:[/bold red] PLEX_LIBRARY_SECTION_IDS {missing} don't exist in this Plex database — every query will silently return 0 rows for them.")
+    console.print("Available library sections:")
+    for row in all_sections:
+        console.print(f"  id={row['id']}  {row['name']!r}  (section_type={row['section_type']})")
+    console.print("Edit PLEX_LIBRARY_SECTION_IDS in the CONFIG block to match your Movies/TV library IDs.\n")
+
+
 def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
     con = open_plex_db()
     con.row_factory = sqlite3.Row
     cur = con.cursor()
+    validate_library_sections(cur)
 
     section_placeholders = ",".join("?" * len(PLEX_LIBRARY_SECTION_IDS))
     cur.execute(
@@ -224,8 +240,7 @@ def load_plex_duplicate_groups(progress, task) -> list[FileRecord]:
         # to the real host path immediately — this is the path actually used for deletion,
         # mtime checks, and display, so there is exactly one source of truth rather than a raw
         # Plex path that quietly never gets translated before os.remove().
-        host_path = to_host_path(r["file"])
-        path_mapped = any(host_path.startswith(host) for _, host in PATH_MAP)
+        host_path, path_mapped = to_host_path(r["file"])
 
         rec = FileRecord(
             group_key=group_key,
@@ -355,12 +370,13 @@ def load_qbit_index() -> dict:
             # path" check below would then match every single file in that library as
             # actively-seeding.
             continue
-        index[to_host_path(cp)] = t.get("hash", "")
+        host_path, mapped = to_host_path(cp)
+        if not mapped:
+            # Same caution as FileRecord.path_mapped: an unrecognized mount is not something
+            # to guess about, so don't let it participate in the seeding/torrent-hash match.
+            continue
+        index[host_path] = t.get("hash", "")
     return index
-
-
-def is_actively_seeding(path: str, qbit_index: dict) -> bool:
-    return torrent_hash_for(path, qbit_index) is not None
 
 
 def torrent_hash_for(path: str, qbit_index: dict) -> Optional[str]:
@@ -602,7 +618,8 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
         )
     console.print(table)
     for i, rec in enumerate(recs, start=1):
-        console.print(f"  [{i}] [dim]{rec.path}[/dim]")
+        unmapped_note = "  [bold red]⚠ unrecognized mount — cannot be deleted by this tool[/bold red]" if not rec.path_mapped else ""
+        console.print(f"  [{i}] [dim]{rec.path}[/dim]{unmapped_note}")
     if suggested is not None:
         console.print(f"  [dim]★ suggested keep (based on Radarr/Sonarr score, then resolution, then HDR/DV, then size — advisory only)[/dim]\n")
     else:
@@ -789,6 +806,12 @@ def main():
 
         cluster_failure = False
         for key, side_a, side_b in cluster["items"]:
+            if key in done:
+                # Already resolved — e.g. handled individually in a prior run after picking
+                # 'i' on this same cluster, or already deleted before an earlier quit. Without
+                # this, re-picking 'a'/'b' would re-attempt os.remove() on an already-deleted
+                # file and log a spurious failure for an episode that's actually fine.
+                continue
             to_keep, to_delete = ([side_a], [side_b]) if choice == "a" else ([side_b], [side_a])
             outcome = delete_one(to_delete[0], to_keep)
             if outcome == "deleted":
