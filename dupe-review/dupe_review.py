@@ -640,18 +640,18 @@ def main():
 
         while True:
             choice = Prompt.ask(
-                f"[bold]Delete[/bold] which number(s)? e.g. '1' or '1,3'  —  'k'=keep all, 'q'=quit"
+                f"[bold]Keep[/bold] which number(s)? e.g. '1' or '1,3'  —  'a'=keep all, 'q'=quit"
             ).strip().lower()
             console.print(f"  [dim](received: {choice!r})[/dim]")
             if choice:
                 break
-            console.print("  [red]No input received — type 'k' to keep all, or a number to delete.[/red]")
+            console.print("  [red]No input received — type 'a' to keep all, or a number to keep.[/red]")
 
         if choice == "q":
             save_state(done)
             break
 
-        if choice == "k":
+        if choice == "a":
             done.add(key)
             kept_all += 1
             save_state(done)
@@ -659,15 +659,15 @@ def main():
             continue
 
         try:
-            delete_indices = {int(x.strip()) - 1 for x in choice.split(",") if x.strip()}
-            if not delete_indices or any(i < 0 or i >= len(recs) for i in delete_indices):
+            keep_indices = {int(x.strip()) - 1 for x in choice.split(",") if x.strip()}
+            if not keep_indices or any(i < 0 or i >= len(recs) for i in keep_indices):
                 raise ValueError
         except ValueError:
             console.print(f"[red]'{choice}' isn't a valid number 1-{len(recs)} — nothing changed, this title will come up again next run.[/red]\n")
             continue
 
-        to_delete = [recs[i] for i in sorted(delete_indices)]
-        to_keep = [r for i, r in enumerate(recs) if i not in delete_indices]
+        to_delete = [r for i, r in enumerate(recs) if i not in keep_indices]
+        to_keep = [recs[i] for i in sorted(keep_indices)]
 
         console.print(f"  [bold]→ Deleting {len(to_delete)}, keeping {len(to_keep)}:[/bold]")
         for rec in to_delete:
