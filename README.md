@@ -16,6 +16,9 @@ This is my repo for my private Unraid media server setup. It includes custom too
 4. **🎬 Duplicate Version Review (interactive)**  
    For titles that exist as more than one *genuinely different* file — different resolution, source, or encode, not exact duplicates — this walks you through each one in a rich terminal UI: a side-by-side comparison table (resolution, bitrate, codec, HDR/DV, audio, size, release group) pulled from Plex's own probed metadata plus Radarr/Sonarr's actual customFormatScore for whichever copy each app tracks. Flags files still actively seeding in qBittorrent, and refuses to suggest a "best" pick when runtimes don't match closely enough to be confident it's really the same content (protects against Plex having mis-grouped unrelated files under one title). You choose what to keep per title; nothing is deleted without an explicit choice.
 
+5. **🗑️ Orphan File Scan**  
+   Finds video files sitting on disk under Movies/tv that are referenced by *neither* qBittorrent nor Plex — failed imports, leftover artifacts from a botched move, raw disc-rip remnants left behind after a proper remux was made, files orphaned by a renamed torrent. Cross-references every torrent's actual file list (not just its category folder) and Plex's full library database, so a file only counts as orphaned if both systems genuinely have no record of it. Recently-modified files are flagged separately rather than called orphaned outright, since a fresh file may just not be indexed yet. Defaults to a report; nothing is deleted without `--apply`, which removes only the exact files found (never a directory) and sweeps up now-empty directories as a separate pass afterward.
+
 ---
 
 ### 🔍 HDD SMART Health Monitoring Script
