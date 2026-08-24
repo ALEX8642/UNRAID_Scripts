@@ -127,12 +127,20 @@ process_library() {
   log "--- $kind: indexing full library tree (this can take a bit) ---"
   find "$host_root" -type f -printf "%s\t%p\n" > "$WORKDIR/${kind}_all.txt"
 
-  # Split into: loose files (under an unmapped path, >= size floor) vs sorted files (the rest)
-  awk -F'\t' -v floor="$MIN_SIZE_BYTES" -v loosef="$WORKDIR/${kind}_loose.txt" -v sortedf="$WORKDIR/${kind}_sorted.txt" '
+  # Split into: loose files (>= size floor) vs sorted files (the rest). A file is loose if
+  # either (a) it's under one of Radarr/Sonarr's unmappedFolders, or (b) it's a direct child
+  # of the root itself — the unmappedFolders API only ever reports unrecognized *directories*,
+  # so a bare scene-named file sitting loose at the library root (no wrapping folder) never
+  # appears in that list and must be caught separately.
+  awk -F'\t' -v floor="$MIN_SIZE_BYTES" -v root="$host_root" -v loosef="$WORKDIR/${kind}_loose.txt" -v sortedf="$WORKDIR/${kind}_sorted.txt" '
     NR==FNR { unmapped[$0]=1; next }
     {
       size=$1; path=$2; under=0;
       for (d in unmapped) { if (index(path, d "/") == 1) { under=1; break } }
+      if (!under && index(path, root "/") == 1) {
+        rest = substr(path, length(root) + 2);
+        if (index(rest, "/") == 0) under = 1;
+      }
       if (under) { if (size+0 >= floor) print $0 >> loosef; }
       else { print $0 >> sortedf; }
     }
