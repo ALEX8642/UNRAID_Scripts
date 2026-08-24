@@ -10,6 +10,9 @@ This is my repo for my private Unraid media server setup. It includes custom too
 2. **⚡ PCIe ASPM Diagnostics**  
    Detects ASPM capability, status, and known blockers (e.g., LSI, ASM, PLX) with actionable summaries and notification support.
 
+3. **🧹 Library Dedupe (Radarr/Sonarr + qBittorrent)**  
+   Finds titles that exist twice — once as a loose, qBittorrent-seeded file outside Radarr/Sonarr's recognized structure, and once as the properly sorted library copy — and removes the sorted duplicate, keeping the seeding copy intact. Matches by exact file size at individual-file granularity (safe for TV season packs, where a season folder holds many episodes). Defaults to a dry run; nothing is deleted without `--apply`.
+
 ---
 
 ### 🔍 HDD SMART Health Monitoring Script
@@ -91,4 +94,52 @@ Scans all PCIe devices and reports ASPM status (Active State Power Management). 
   ASPM Disabled but fixable (Try): 1
   Blocked (LSI/ASM/PLX): 7
   Unsupported: 14
+```
+
+---
+### 🧹 Library Dedupe Script (Radarr/Sonarr + qBittorrent)
+
+If you hardlink-seed with qBittorrent alongside Radarr/Sonarr, it's easy to end up with a
+title existing twice on disk: once as the raw, scene-named file qBittorrent is actively
+seeding (living outside Radarr/Sonarr's recognized folder structure), and once as the
+properly renamed/sorted copy Radarr/Sonarr and Plex actually use. If those two copies ever
+stop being a true hardlink (e.g. from a cross-disk move, or downloads/library briefly using
+cache), you're silently paying for the same file twice. This script finds those pairs and
+removes the sorted duplicate, keeping the loose copy so qBittorrent keeps seeding
+uninterrupted.
+
+**Key Features:**
+
+- **Matches by exact file size** within each app's own library tree — only acts on a match
+  that's unique (exactly one candidate); ambiguous matches are skipped and logged, never
+  guessed at.
+- **File-level, not folder-level, deletion.** A TV "loose" match is often a season-pack
+  folder whose files share a real `Season XX/` folder with unrelated episodes — only the one
+  matched file is ever removed, never a whole directory that might hold siblings.
+- **Hit-and-run protection**: skips any match where the loose file is both younger than
+  `PROTECT_AGE_DAYS` (default 30) and still associated with an active torrent in
+  qBittorrent — recent content gets left alone. On top of that, as an unconditional check
+  with no age exception, it refuses to delete anything that is itself an active qBittorrent
+  torrent path, regardless of how the match was derived.
+- **Dry run by default.** Reports exactly what it would delete and why anything was skipped;
+  nothing is touched until you pass `--apply`.
+- Logs every run (matches, skips, and reasons) to a logfile for review.
+
+> 📂 Script path: `user.scripts/Library_Dedupe`  
+> 🕒 Recommended: Run occasionally (manually, or scheduled via User Scripts) as new content
+> accumulates  
+> ⚙️ Requires: `curl`, `jq`; a Radarr and/or Sonarr instance with API access, and
+> qBittorrent's WebUI API enabled. Edit the CONFIG block at the top of the script with your
+> own API keys/credentials and library paths before running — ship it with placeholders, not
+> real secrets.
+
+---
+**Example Script Description (for Unraid UI):**
+
+```text
+Finds titles duplicated between a loose qBittorrent-seeded file and Radarr/Sonarr's sorted
+library copy, and deletes the sorted duplicate while preserving the seeding file. Matches by
+exact file size, file-level granularity (safe for TV season packs), skips ambiguous matches,
+and protects recent/actively-seeding content from deletion (hit-and-run safe). Dry-run by
+default — pass --apply to actually delete.
 ```
