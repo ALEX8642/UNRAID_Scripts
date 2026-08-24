@@ -976,6 +976,11 @@ def main():
     report_only = "--report-only" in sys.argv
     reset = "--reset" in sys.argv
     use_trash = "--trash" in sys.argv
+    # Off by default: for a library where Radarr/Sonarr's stale "still has the file" bookkeeping
+    # is being used on purpose to stop automatic search from re-grabbing (or worse, silently
+    # "upgrading" away) a release you deliberately kept — see the comment on maybe_reconcile()
+    # below. Pass --reconcile to opt in to asking Radarr/Sonarr to import the kept file instead.
+    use_reconcile = "--reconcile" in sys.argv
 
     missing = [n for n, v in [("RADARR_KEY", RADARR_KEY), ("SONARR_KEY", SONARR_KEY), ("QBIT_PASS", QBIT_PASS)] if not v]
     if missing:
@@ -998,6 +1003,8 @@ def main():
     console.print(f"\n[bold]{len(groups)}[/bold] titles have more than one version in your library.\n")
     if use_trash:
         console.print(f"[dim]--trash active: deletions move to {TRASH_DIR}/<run> instead of being removed outright. Not auto-cleaned — that's on you.[/dim]\n")
+    if use_reconcile:
+        console.print("[dim]--reconcile active: keeping a loose file over a Radarr/Sonarr-tracked one will ask that app to import the kept file. Skip this flag if you'd rather that title's record stay stale (stops automatic search from re-grabbing it).[/dim]\n")
 
     done = set() if reset else load_state()
     total_freed = 0
@@ -1015,6 +1022,17 @@ def main():
     quit_requested = False
 
     def maybe_reconcile(to_keep: list[FileRecord], to_delete_rec: FileRecord):
+        # Off by default — see the --reconcile comment in main() for why. Leaving Radarr/Sonarr's record
+        # stale (still believing it has the file you just deleted) is not a bug for every
+        # setup: if the stale record's remembered quality already meets your quality profile's
+        # cutoff, that app's automatic search skips the title entirely — no missing-search, no
+        # upgrade-search. That can be exactly what you want when you've deliberately kept a
+        # release you judge better than anything currently gettable, and don't want it silently
+        # replaced (or unmonitored into a permanent gap) the next time something rescans it.
+        # Pass --reconcile only if you actually want this tool to un-stale that bookkeeping by
+        # asking the app to import the file you kept.
+        if not use_reconcile:
+            return
         if len(to_keep) != 1 or to_delete_rec.tracked_by not in ("Radarr", "Sonarr"):
             return
         if to_keep[0].tracked_by in ("Radarr", "Sonarr"):

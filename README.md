@@ -185,9 +185,18 @@ side-by-side comparison and asks what to keep.
   Disc 2, CD1/CD2) are flagged as NOT the same content and never get an auto-suggestion.
 - **Optional `--trash`**: moves deletions into `logs/trash/<run>/` instead of removing them
   outright, for an undo window. Not auto-cleaned — that's a separate, deliberate step.
-- **Best-effort Radarr/Sonarr reconciliation**: if you keep the loose file over the one
-  Radarr/Sonarr was tracking, it asks that app to manually import the kept file so it's tracked
-  again instead of silently thinking the title is missing (and possibly re-grabbing it).
+- **Optional `--reconcile`** (off by default): if you keep the loose file over the one
+  Radarr/Sonarr was tracking, asks that app to import the kept file so it's tracked again
+  instead of staying stale. **Why this defaults off**, for anyone whose setup looks
+  "improperly" configured on paper: a stale record — Radarr/Sonarr still believing it has the
+  file you just deleted — is not automatically a problem. If that record's remembered quality
+  already meets your quality profile's cutoff, automatic search skips the title entirely: no
+  missing-search, no upgrade-search. That's genuinely useful when you've deliberately kept a
+  release you judge better than anything currently available, and don't want it silently
+  replaced — the alternative (rescanning to correct the bookkeeping) either re-grabs something
+  you don't want, or unmonitors the title into a permanent gap you have to remember to fix
+  yourself. Only pass `--reconcile` if you actually want this tool correcting that bookkeeping
+  for you.
 - **Optional automatic Plex refresh + Empty Trash** at the end of a session that deleted
   anything, if `PLEX_TOKEN` is set — otherwise just reminds you to do it manually.
 - Progress counter (`[Title 42/335]`) and progress bars while scanning; resumable — a title's
@@ -202,7 +211,8 @@ side-by-side comparison and asks what to keep.
 > (needed to actually delete/trash files). Copy `.env.example` to `.env` in the same directory
 > and fill in your Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN`) —
 > `.env` is gitignored, never commit real values. Run via `./run.sh` (add `--report-only` to
-> preview without prompts, `--trash` for soft-delete, `--reset` to re-review everything).
+> preview without prompts, `--trash` for soft-delete, `--reconcile` to opt in to Radarr/Sonarr
+> re-import, `--reset` to re-review everything).
 
 ---
 **Example Script Description (for Unraid UI):**
