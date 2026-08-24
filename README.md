@@ -13,6 +13,9 @@ This is my repo for my private Unraid media server setup. It includes custom too
 3. **🧹 Library Dedupe (Radarr/Sonarr + qBittorrent)**  
    Finds titles that exist twice — once as a loose, qBittorrent-seeded file outside Radarr/Sonarr's recognized structure, and once as the properly sorted library copy — and removes the sorted duplicate, keeping the seeding copy intact. Matches by exact file size at individual-file granularity (safe for TV season packs, where a season folder holds many episodes). Defaults to a dry run; nothing is deleted without `--apply`.
 
+4. **🎬 Duplicate Version Review (interactive)**  
+   For titles that exist as more than one *genuinely different* file — different resolution, source, or encode, not exact duplicates — this walks you through each one in a rich terminal UI: a side-by-side comparison table (resolution, bitrate, codec, HDR/DV, audio, size, release group) pulled from Plex's own probed metadata plus Radarr/Sonarr's actual customFormatScore for whichever copy each app tracks. Flags files still actively seeding in qBittorrent, and refuses to suggest a "best" pick when runtimes don't match closely enough to be confident it's really the same content (protects against Plex having mis-grouped unrelated files under one title). You choose what to keep per title; nothing is deleted without an explicit choice.
+
 ---
 
 ### 🔍 HDD SMART Health Monitoring Script
@@ -142,4 +145,56 @@ library copy, and deletes the sorted duplicate while preserving the seeding file
 exact file size, file-level granularity (safe for TV season packs), skips ambiguous matches,
 and protects recent/actively-seeding content from deletion (hit-and-run safe). Dry-run by
 default — pass --apply to actually delete.
+```
+
+---
+### 🎬 Duplicate Version Review Script (interactive, rich terminal UI)
+
+The exact-size dedupe script above only handles *true* duplicates — the same bytes sitting in
+two places. It deliberately leaves alone titles that exist as more than one file where the
+files are genuinely different (a 1080p Remux next to a 4K WEB-DL, an SDR encode next to a
+Dolby Vision one, etc.) — that's a real quality/preference decision, not something safe to
+automate. This script makes reviewing that backlog fast without taking the decision away from
+you: for every title Plex already knows has more than one version, it prints a full
+side-by-side comparison and asks what to keep.
+
+**Key Features:**
+
+- **Reads Plex's own probed metadata** (resolution, bitrate, codec, HDR/DV, audio) instead of
+  re-parsing filenames — Plex already ran ffprobe on every file, and already grouped
+  same-title files together as "versions."
+- **Pulls the real Radarr/Sonarr customFormatScore** for whichever file each app currently
+  tracks, straight from their API — reflects your actual configured quality-profile
+  preferences rather than a guess this script invents.
+- **Runtime-mismatch guard**: if the "versions" of a title have runtimes that don't match
+  closely, it refuses to suggest a "best" pick and prints a loud warning instead. Plex
+  occasionally mis-groups unrelated files (e.g. a multi-track music demo disc) under one
+  title — this catches that before you trust a suggestion that would delete the wrong thing.
+- **qBittorrent-aware**: flags any candidate-for-deletion file that is still an actively
+  seeding torrent, and requires a second explicit confirmation before deleting it.
+- **Never deletes automatically.** Every group requires a typed choice — keep one, keep
+  several, or keep all (skip). `--report-only` previews every group with no prompts and no
+  deletions, useful for a first look or for re-testing after a config change.
+- Progress bars while it scans Plex + cross-references Radarr/Sonarr/qBittorrent; resumable
+  (remembers which titles you've already decided on across runs, `--reset` to start over).
+
+> 📂 Script path: `dupe-review/` (Dockerfile + `dupe_review.py` + `run.sh`)  
+> 🕒 Recommended: Run after the exact-size dedupe script, as a periodic cleanup pass  
+> ⚙️ Requires: Docker (builds a small `python:3.12-slim` image with `rich`+`requests`, run with
+> `--network host` so it can reach Radarr/Sonarr/qBittorrent on `localhost`); a read-only bind
+> mount of Plex's `Plug-in Support/Databases` folder. Edit the CONFIG block at the top of
+> `dupe_review.py` with your own API keys/credentials before running — ship it with
+> placeholders, not real secrets. Run via `./run.sh` (add `--report-only` to preview without
+> prompts).
+
+---
+**Example Script Description (for Unraid UI):**
+
+```text
+Interactive rich-terminal review of Plex titles that exist as more than one genuinely
+different file (quality/source/encode, not exact duplicates). Shows a side-by-side comparison
+(resolution, bitrate, codec, HDR/DV, audio, size, release group, Radarr/Sonarr quality score)
+per title and asks what to keep. Warns when runtimes don't match closely enough to trust a
+suggestion (protects against Plex mis-grouping unrelated files), and flags files still
+actively seeding in qBittorrent. Nothing is deleted without an explicit per-title choice.
 ```
