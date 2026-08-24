@@ -11,7 +11,16 @@ fi
 
 docker build -q -t plex-mothership . >/dev/null
 mkdir -p logs
-docker run --rm -it --network host \
+
+# Only request a TTY when one actually exists — a real interactive shell has one (menu or a
+# subcommand you're typing yourself), but cron/scripted invocations (e.g. a scheduled
+# "./run.sh dedupe --apply") have none, and `-it` fails outright without one.
+DOCKER_STDIN_FLAGS="-i"
+if [ -t 0 ]; then
+  DOCKER_STDIN_FLAGS="-it"
+fi
+
+docker run --rm $DOCKER_STDIN_FLAGS --network host \
   -v "/mnt/docker/plex/Library/Application Support:/plexdata:ro" \
   -v "/mnt/user/Media:/mnt/user/Media" \
   -v "$(pwd)/logs:/logs" \

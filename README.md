@@ -112,9 +112,11 @@ for cleaning that up, plus a menu so you don't have to remember which mode to ru
 order, or which flags each one takes.
 
 Every mode defaults to a dry run / report and requires an explicit choice or `--apply` before
-touching anything. Run interactively (`./run.sh`) for a menu, or invoke a mode directly and
-non-interactively for scripted/cron use — `./run.sh dedupe --apply`, `./run.sh orphan-scan`,
-etc. — with no menu prompts in the way.
+touching anything. Run interactively (`./run.sh`) for a menu, or invoke a mode directly to
+skip the launcher's own menu prompts — `./run.sh dedupe --apply`, `./run.sh orphan-scan`.
+Modes 1 and 3 have no other prompts either, so those two are genuinely cron-safe as shown.
+Mode 2 (`dupe-review`) is inherently interactive — it asks what to keep per title — unless
+you pass `--report-only`, which is the only way to run it unattended.
 
 #### Mode 1 — Exact-duplicate cleanup
 
@@ -234,7 +236,9 @@ references any more.
 > actually delete/trash files). Copy `.env.example` to `.env` in the same directory and fill
 > in your Radarr/Sonarr/qBittorrent credentials (and optionally `PLEX_TOKEN` for Mode 2's
 > auto-refresh) — `.env` is gitignored, never commit real values. Run via `./run.sh` for the
-> interactive menu, or `./run.sh <mode> [flags]` to skip straight to one mode non-interactively.
+> interactive menu, or `./run.sh <mode> [flags]` to skip straight to one mode, bypassing the
+> launcher's own prompts (Modes 1 and 3 need no further input either; Mode 2 still asks what
+> to keep per title unless you pass `--report-only`).
 
 ---
 **Example Script Description (for Unraid UI):**
@@ -245,6 +249,7 @@ exact-duplicate cleanup (byte-identical loose-vs-sorted matches, hit-and-run saf
 interactive rich-terminal review for titles that exist as more than one genuinely different
 file (quality/source/encode), and an orphan file scan (files neither qBittorrent nor Plex has
 any record of). Every mode defaults to a dry run/report; nothing is deleted without an
-explicit choice or --apply. Run interactively via a menu, or invoke a mode directly and
-non-interactively for scripted/cron use.
+explicit choice or --apply. Run interactively via a menu, or invoke a mode directly to bypass
+the menu — the exact-duplicate and orphan-scan modes are fully cron-safe this way; the
+duplicate-review mode still asks what to keep per title unless run with --report-only.
 ```

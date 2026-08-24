@@ -1,13 +1,10 @@
 """
-common.py — shared logic used by every tool in this repo. Single source of truth for
-container-path -> host-path conversion, since two independently-maintained copies of this
-exact logic once diverged (one got fixed for a bare-category-root edge case, the other
-didn't) and caused a real hit-and-run near-miss against a live library.
-
-This file is intentionally small and kept byte-identical across dupe-review/, orphan-scan/,
-and mothership/ (Docker builds each in an isolated context, so it can't be a single physical
-file on disk the way it is within mothership/, where both tools share this one copy) — if you
-ever fix or extend anything in here, port the exact same change to the other two copies.
+common.py — shared logic for dupe_review.py and orphan_scan.py, both bundled into this one
+mothership/ image. Single source of truth for container-path -> host-path conversion, since
+two independently-maintained copies of this exact logic once diverged (one got fixed for a
+bare-category-root edge case, the other didn't) and caused a real hit-and-run near-miss
+against a live library — this file is what both tools import instead of each defining it
+themselves, so that specific failure mode can't recur.
 """
 
 # Container-path -> host-path prefixes. Edit these for your setup.

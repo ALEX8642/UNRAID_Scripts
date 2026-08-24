@@ -148,6 +148,13 @@ def main():
     if argv and argv[0] in SUBCOMMANDS:
         run_subcommand(argv[0], argv[1:])
         return
+    if argv:
+        # An unrecognized first arg must error, not silently fall through to the interactive
+        # menu — under cron (no stdin) that menu's Prompt.ask() would EOFError-crash with a
+        # confusing traceback instead of a clear "you typed something wrong" message.
+        console.print(f"[red]Unknown subcommand: {argv[0]!r}[/red]\n")
+        print_help()
+        sys.exit(1)
 
     console.print(Panel("[bold]Plex Library Maintenance[/bold]", style="magenta"))
     while True:
