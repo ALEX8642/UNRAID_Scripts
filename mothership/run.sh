@@ -22,7 +22,7 @@ fi
 
 docker run --rm $DOCKER_STDIN_FLAGS --network host \
   -v "/mnt/docker/plex/Library/Application Support:/plexdata:ro" \
-  -v "/mnt/user/Media:/mnt/user/Media" \
+  -v "/mnt:/mnt" \
   -v "$(pwd)/logs:/logs" \
   --env-file .env \
   plex-mothership "$@"

@@ -3,8 +3,9 @@
 dupe-review.py
 
 Interactive terminal tool for reviewing "fuzzy" duplicates in a Plex library — titles that
-exist as more than one file (different quality/source/encode), as opposed to the exact
-byte-identical duplicates dedupe-library.sh already handles.
+exist as more than one file (different quality/source/encode), as opposed to exact
+byte-identical duplicates (see cross-disk-dedupe.sh for the one remaining class of those:
+the same file physically present on two different array disks).
 
 Data sources:
   - Plex's own SQLite DB: Plex already ffprobed every file and already grouped same-title
@@ -58,8 +59,8 @@ LOGFILE = "/logs/dupe-review.log"
 STATE_FILE = "/logs/dupe-review-state.json"
 
 # Only require an extra confirmation before deleting an actively-seeding file if it's younger
-# than this — matches dedupe-library.sh's PROTECT_AGE_DAYS. Anything older is well past any
-# realistic hit-and-run window, so it deletes with no extra prompt.
+# than this. Anything older is well past any realistic hit-and-run window, so it deletes with
+# no extra prompt.
 PROTECT_AGE_DAYS = 30
 
 # Where soft-deleted files go when run with --trash instead of being removed outright. Not
@@ -349,7 +350,7 @@ def enrich_with_arr(rec: FileRecord, radarr_idx: dict, sonarr_idx: dict):
 
 
 # ---------------------------------------------------------------------------
-# qBittorrent active-seeding index (hit-and-run guard, same as dedupe-library.sh)
+# qBittorrent active-seeding index (hit-and-run guard)
 # ---------------------------------------------------------------------------
 
 def load_qbit_index() -> dict:
@@ -992,7 +993,7 @@ def main():
         console.print("Copy .env.example to .env in this directory, fill them in, then run via ./run.sh")
         sys.exit(1)
 
-    console.print(Panel("[bold]Plex Library Duplicate Review[/bold]\nFuzzy/quality duplicates — not exact-match dupes (those are handled by dedupe-library.sh)", style="magenta"))
+    console.print(Panel("[bold]Plex Library Duplicate Review[/bold]\nFuzzy/quality duplicates — genuinely different files, not exact-match dupes", style="magenta"))
 
     with Progress(
         SpinnerColumn(), TextColumn("[progress.description]{task.description}"),

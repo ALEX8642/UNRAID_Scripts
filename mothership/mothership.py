@@ -3,16 +3,22 @@
 mothership.py
 
 Single entry point for the three library-maintenance tools in this repo:
-  1. dedupe-library.sh — exact-duplicate cleanup (loose file vs Radarr/Sonarr-sorted copy,
-     byte-identical only, matched by file size)
-  2. dupe-review.py    — interactive review of titles that exist as more than one genuinely
+  1. cross-disk-dedupe.sh — finds files that physically exist twice across two different
+     array disks (invisible to every other tool here, which all read through /mnt/user)
+  2. dupe-review.py       — interactive review of titles that exist as more than one genuinely
      different file (quality/source/encode)
-  3. orphan-scan.py    — files on disk claimed by neither Plex nor qBittorrent
+  3. orphan-scan.py       — files on disk claimed by neither Plex nor qBittorrent
 
 This runs each tool's own, already-tested code completely unchanged — it only picks which
 one(s) to run, prompts for the args each one already supports, and (for "run all") sequences
 them in the order that makes sense: cheap byte-identical wins first, then the judgment calls,
 then a final sweep for anything left behind by either.
+
+dedupe-library.sh (loose file vs. Radarr/Sonarr-sorted copy, matched by same inode) was
+retired 2026-08-25 — its still-hardlinked cleanup caused a real incident (deleting one name of
+a hardlinked pair broke qBittorrent's own path-based tracking) and its remaining purpose is
+fully superseded by cross-disk-dedupe.sh's more careful checks. It's gone from the repo, not
+just disabled.
 """
 
 import os
@@ -27,16 +33,16 @@ from rich.prompt import Prompt, Confirm
 console = Console()
 
 sys.path.insert(0, "/app")
-DEDUPE_SH = "/app/dedupe-library.sh"
+CROSS_DISK_DEDUPE_SH = "/app/cross-disk-dedupe.sh"
 
 
-def run_dedupe_sh(apply: bool) -> int:
-    """Runs dedupe-library.sh, streaming its output live (plain print, not console.print —
+def run_cross_disk_dedupe_sh(apply: bool) -> int:
+    """Runs cross-disk-dedupe.sh, streaming its output live (plain print, not console.print —
     its lines start with a bracketed timestamp, which rich would otherwise try to parse as a
-    markup tag). Returns the total deleted/would-delete count parsed out of its per-library
-    summary lines, so the caller can skip asking to apply when nothing was actually found."""
-    args = ["bash", DEDUPE_SH] + (["--apply"] if apply else [])
-    console.print(Panel(f"[bold]dedupe-library.sh[/bold] — {'APPLY' if apply else 'dry run'}", style="cyan"))
+    markup tag). Returns the total resolved count parsed out of its summary line, so the
+    caller can skip asking to apply when nothing was actually found."""
+    args = ["bash", CROSS_DISK_DEDUPE_SH] + (["--apply"] if apply else [])
+    console.print(Panel(f"[bold]cross-disk-dedupe.sh[/bold] — {'APPLY' if apply else 'dry run'}", style="cyan"))
     total_found = 0
     proc = subprocess.Popen(
         args, env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
@@ -44,22 +50,21 @@ def run_dedupe_sh(apply: bool) -> int:
     assert proc.stdout is not None
     for line in proc.stdout:
         print(line, end="")
-        m = re.search(r"summary: (\d+) deleted", line)
+        m = re.search(r"summary: (\d+) resolved", line)
         if m:
             total_found += int(m.group(1))
     proc.wait()
     return total_found
 
 
-def dedupe_flow():
-    console.print(Panel("[bold]Exact-Duplicate Cleanup[/bold]\nByte-identical loose-vs-sorted matches only. Always previews before deleting anything.", style="magenta"))
-    found = run_dedupe_sh(apply=False)
+def cross_disk_dedupe_flow():
+    console.print(Panel("[bold]Cross-Disk Duplicate Cleanup[/bold]\nFiles that physically exist on two different array disks at the same library path — invisible to every other tool here. Always previews before deleting anything.", style="magenta"))
+    found = run_cross_disk_dedupe_sh(apply=False)
     if found == 0:
-        console.print("\n[green]Nothing to clean up — no exact duplicates found.[/green]")
+        console.print("\n[green]Nothing to clean up — no cross-disk duplicates found.[/green]")
         return
     if Confirm.ask(f"\n{found} duplicate(s) found — apply these deletions now?", default=False):
-        run_dedupe_sh(apply=True)
-        console.print("[dim]Remember: Plex needs a library scan + Empty Trash to stop showing these as duplicates (dupe-review's --reconcile aside, this tool doesn't touch Plex).[/dim]")
+        run_cross_disk_dedupe_sh(apply=True)
 
 
 def call_module_main(module_name: str, argv: list[str]):
@@ -138,12 +143,12 @@ def orphan_scan_flow():
 def run_all():
     console.print(Panel(
         "[bold]Running all three in the recommended order:[/bold]\n"
-        "1. Exact-duplicate cleanup (cheap, byte-identical wins)\n"
+        "1. Cross-disk duplicate cleanup (cheap, byte-identical wins)\n"
         "2. Quality-based duplicate review (judgment calls)\n"
         "3. Orphan scan (final sweep for anything left behind)",
         style="magenta",
     ))
-    dedupe_flow()
+    cross_disk_dedupe_flow()
     console.print()
     dupe_review_flow()
     console.print()
@@ -152,22 +157,23 @@ def run_all():
 
 
 MENU = {
-    "1": ("Exact-duplicate cleanup (dedupe-library.sh)", dedupe_flow),
+    "1": ("Cross-disk duplicate cleanup (cross-disk-dedupe.sh)", cross_disk_dedupe_flow),
     "2": ("Quality-based duplicate review (dupe-review)", dupe_review_flow),
     "3": ("Orphan file scan", orphan_scan_flow),
     "4": ("Run all three, in the recommended order", run_all),
     "q": ("Quit", None),
 }
 
-SUBCOMMANDS = {"dedupe", "dupe-review", "orphan-scan"}
+SUBCOMMANDS = {"cross-disk-dedupe", "dupe-review", "orphan-scan"}
 
 
 def run_subcommand(name: str, rest: list[str]):
     """Non-interactive entry point — runs one tool directly with the given args, no menu, no
     extra prompts beyond what that tool already asks on its own (e.g. dupe-review's per-title
-    choices). For scripted/cron use, such as a scheduled `mothership.py dedupe --apply` run."""
-    if name == "dedupe":
-        run_dedupe_sh(apply="--apply" in rest)
+    choices). For scripted/cron use, such as a scheduled `mothership.py cross-disk-dedupe
+    --apply` run."""
+    if name == "cross-disk-dedupe":
+        run_cross_disk_dedupe_sh(apply="--apply" in rest)
     elif name == "dupe-review":
         call_module_main("dupe_review", rest)
     elif name == "orphan-scan":
@@ -178,12 +184,12 @@ def print_help():
     console.print(
         "[bold]Usage:[/bold]\n"
         "  mothership.py                          Interactive menu\n"
-        "  mothership.py dedupe [--apply]\n"
+        "  mothership.py cross-disk-dedupe [--apply]\n"
         "  mothership.py dupe-review [--report-only] [--trash] [--reconcile] [--reset]\n"
         "  mothership.py orphan-scan [--apply] [--exclude PATH ...]\n\n"
         "Subcommands run directly with no extra menu prompts — for scripted/cron use (e.g. a\n"
-        "scheduled 'mothership.py dedupe --apply' run). Omit the subcommand for the\n"
-        "interactive menu."
+        "scheduled 'mothership.py cross-disk-dedupe --apply' run). Omit the subcommand for\n"
+        "the interactive menu."
     )
 
 
