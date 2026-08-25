@@ -1,9 +1,14 @@
 #!/bin/bash
 # tag-tracker-issues.sh
 #
-# Scans every torrent's tracker status and adds a qBittorrent tag describing any real
+# Scans every torrent's tracker status and syncs a qBittorrent tag describing any real
 # tracker-reported problem, so they can be sorted/filtered in the WebUI. Never touches files,
-# never removes a torrent, never changes seeding behavior — purely additive tags.
+# never removes a torrent, never changes seeding behavior — only ever adds/removes these tags.
+#
+# Fully synced each run, safe for a recurring cron: a torrent gets the tag if it currently has
+# that problem, and loses the tag if it no longer does (e.g. Sonarr/Radarr upgraded a "trumped"
+# release, or a tracker-auth issue got fixed). Without this, tags would only ever accumulate
+# and a stale tag would be indistinguishable from a current one.
 #
 # Categories (checked in this order, first match wins per torrent):
 #   trumped        - tracker says a better release now supersedes this one (BHD "Trumped: ...")
@@ -96,30 +101,54 @@ for h in $HASHES; do
   esac
 done
 
-apply_tag() {
+# Syncs one tag to exactly the torrents in $file: adds it to any that don't have it yet,
+# removes it from any that currently have it but no longer belong (problem resolved). This is
+# what makes the tool safe for a recurring cron — a tag always reflects the CURRENT scan, never
+# a stale leftover from a past run.
+sync_tag() {
   local file="$1" tag="$2"
-  local count
-  count=$(wc -l < "$file")
-  [ "$count" -eq 0 ] && return
-  local hashes
-  hashes=$(paste -sd '|' "$file")
+  local current_file="$WORKDIR/current_${tag}.txt"
+
+  sort -o "$file" "$file"
+  curl -s -b "$COOKIE" "$QBIT_URL/api/v2/torrents/info" --data-urlencode "tag=$tag" \
+    | jq -r '.[].hash' | sort > "$current_file"
+
+  local to_add to_remove add_count remove_count
+  to_add=$(comm -13 "$current_file" "$file")
+  to_remove=$(comm -23 "$current_file" "$file")
+  add_count=$(grep -c . <<< "$to_add" || true)
+  remove_count=$(grep -c . <<< "$to_remove" || true)
+  [ -z "$to_add" ] && add_count=0
+  [ -z "$to_remove" ] && remove_count=0
+
   if [ "$DRY_RUN" -eq 1 ]; then
-    log "WOULD TAG '$tag': $count torrent(s)"
-  else
-    curl -s -b "$COOKIE" -X POST "$QBIT_URL/api/v2/torrents/addTags" \
-      --data-urlencode "hashes=$hashes" --data-urlencode "tags=$tag" > /dev/null
-    log "TAGGED '$tag': $count torrent(s)"
+    [ "$add_count" -gt 0 ] && log "WOULD ADD '$tag': $add_count torrent(s)"
+    [ "$remove_count" -gt 0 ] && log "WOULD REMOVE '$tag': $remove_count torrent(s) (no longer applies)"
+    [ "$add_count" -eq 0 ] && [ "$remove_count" -eq 0 ] && log "'$tag': no change needed ($(wc -l < "$file") torrent(s))"
+    return
   fi
+
+  if [ "$add_count" -gt 0 ]; then
+    curl -s -b "$COOKIE" -X POST "$QBIT_URL/api/v2/torrents/addTags" \
+      --data-urlencode "hashes=$(tr '\n' '|' <<< "$to_add")" --data-urlencode "tags=$tag" > /dev/null
+    log "ADDED '$tag': $add_count torrent(s)"
+  fi
+  if [ "$remove_count" -gt 0 ]; then
+    curl -s -b "$COOKIE" -X POST "$QBIT_URL/api/v2/torrents/removeTags" \
+      --data-urlencode "hashes=$(tr '\n' '|' <<< "$to_remove")" --data-urlencode "tags=$tag" > /dev/null
+    log "REMOVED '$tag': $remove_count torrent(s) (no longer applies)"
+  fi
+  [ "$add_count" -eq 0 ] && [ "$remove_count" -eq 0 ] && log "'$tag': no change ($(wc -l < "$file") torrent(s), unchanged)"
 }
 
-apply_tag "$WORKDIR/trumped.txt" "trumped"
-apply_tag "$WORKDIR/tracker-deleted.txt" "tracker-deleted"
-apply_tag "$WORKDIR/tracker-missing.txt" "tracker-missing"
-apply_tag "$WORKDIR/tracker-auth.txt" "tracker-auth"
-apply_tag "$WORKDIR/tracker-issue.txt" "tracker-issue"
+sync_tag "$WORKDIR/trumped.txt" "trumped"
+sync_tag "$WORKDIR/tracker-deleted.txt" "tracker-deleted"
+sync_tag "$WORKDIR/tracker-missing.txt" "tracker-missing"
+sync_tag "$WORKDIR/tracker-auth.txt" "tracker-auth"
+sync_tag "$WORKDIR/tracker-issue.txt" "tracker-issue"
 
 rm -f "$COOKIE"
 log "=== tag-tracker-issues run finished ==="
 if [ "$DRY_RUN" -eq 1 ]; then
-  log "This was a dry run. Review the counts above, then re-run with --apply to actually add tags."
+  log "This was a dry run. Review the counts above, then re-run with --apply to sync the tags."
 fi
