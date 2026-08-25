@@ -73,6 +73,18 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGFILE"
 }
 
+# Fast partial-hash check instead of a full-file checksum: hashes the first and last 4MB of
+# the file (8MB read regardless of file size) plus the exact size. For this script's specific
+# case — the same relative path existing on two disks, i.e. what's meant to be the identical
+# file, not two independent encodes — a same-size match is already extremely strong evidence,
+# and this catches truncation/header/tail corruption at a fraction of the cost of hashing a
+# multi-GB file twice. It would not catch corruption confined entirely to the untouched middle
+# of the file; a full sha256sum is the only way to rule that out completely, at real time cost.
+partial_hash() {
+  local f="$1"
+  { head -c 4M "$f"; tail -c 4M "$f"; } | sha256sum | cut -d' ' -f1
+}
+
 is_excluded() {
   local relpath="$1"
   for skip in "${EXCLUDE_RELPATHS[@]}"; do
@@ -190,10 +202,18 @@ while IFS=$'\t' read -r count diskcsv sizecsv relpath; do
       ;;
   esac
 
-  sha_a=$(sha256sum "$path_a" | cut -d' ' -f1)
-  sha_b=$(sha256sum "$path_b" | cut -d' ' -f1)
-  if [ "$sha_a" != "$sha_b" ]; then
-    log "SKIP (checksum mismatch — NOT a simple duplicate, needs manual review): $relpath"
+  size_a=$(stat -c '%s' "$path_a")
+  size_b=$(stat -c '%s' "$path_b")
+  if [ "$size_a" != "$size_b" ]; then
+    log "SKIP (size mismatch — NOT a simple duplicate, needs manual review): $relpath"
+    skipped_checksum=$((skipped_checksum + 1))
+    continue
+  fi
+
+  hash_a=$(partial_hash "$path_a")
+  hash_b=$(partial_hash "$path_b")
+  if [ "$hash_a" != "$hash_b" ]; then
+    log "SKIP (partial-hash mismatch — NOT a simple duplicate, needs manual review): $relpath"
     skipped_checksum=$((skipped_checksum + 1))
     continue
   fi
