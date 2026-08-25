@@ -2,12 +2,15 @@
 """
 mothership.py
 
-Single entry point for the three library-maintenance tools in this repo:
-  1. cross-disk-dedupe.sh — finds files that physically exist twice across two different
+Single entry point for the four library-maintenance tools in this repo:
+  1. cross-disk-dedupe.sh   — finds files that physically exist twice across two different
      array disks (invisible to every other tool here, which all read through /mnt/user)
-  2. dupe-review.py       — interactive review of titles that exist as more than one genuinely
-     different file (quality/source/encode)
-  3. orphan-scan.py       — files on disk claimed by neither Plex nor qBittorrent
+  2. dupe-review.py         — interactive review of titles that exist as more than one
+     genuinely different file (quality/source/encode)
+  3. orphan-scan.py         — files on disk claimed by neither Plex nor qBittorrent
+  4. tag-tracker-issues.sh  — tags torrents by real tracker-reported problems (trumped,
+     deleted, unregistered, auth) so they can be sorted/filtered in qBittorrent's WebUI.
+     Purely additive — never touches files or torrent behavior.
 
 This runs each tool's own, already-tested code completely unchanged — it only picks which
 one(s) to run, prompts for the args each one already supports, and (for "run all") sequences
@@ -34,6 +37,7 @@ console = Console()
 
 sys.path.insert(0, "/app")
 CROSS_DISK_DEDUPE_SH = "/app/cross-disk-dedupe.sh"
+TAG_TRACKER_ISSUES_SH = "/app/tag-tracker-issues.sh"
 
 
 def run_cross_disk_dedupe_sh(apply: bool) -> int:
@@ -55,6 +59,26 @@ def run_cross_disk_dedupe_sh(apply: bool) -> int:
             total_found += int(m.group(1))
     proc.wait()
     return total_found
+
+
+def run_tag_tracker_issues_sh(apply: bool):
+    """Runs tag-tracker-issues.sh, streaming its output live."""
+    args = ["bash", TAG_TRACKER_ISSUES_SH] + (["--apply"] if apply else [])
+    console.print(Panel(f"[bold]tag-tracker-issues.sh[/bold] — {'APPLY' if apply else 'dry run'}", style="cyan"))
+    proc = subprocess.Popen(
+        args, env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+    proc.wait()
+
+
+def tag_tracker_issues_flow():
+    console.print(Panel("[bold]Tag Tracker Issues[/bold]\nTags torrents by real tracker-reported problems (trumped, deleted, unregistered, auth) so they can be sorted/filtered in qBittorrent. Never touches files or torrent behavior — purely additive tags. Always previews first.", style="magenta"))
+    run_tag_tracker_issues_sh(apply=False)
+    if Confirm.ask("\nApply these tags now?", default=False):
+        run_tag_tracker_issues_sh(apply=True)
 
 
 def cross_disk_dedupe_flow():
@@ -142,10 +166,11 @@ def orphan_scan_flow():
 
 def run_all():
     console.print(Panel(
-        "[bold]Running all three in the recommended order:[/bold]\n"
+        "[bold]Running all four in the recommended order:[/bold]\n"
         "1. Cross-disk duplicate cleanup (cheap, byte-identical wins)\n"
         "2. Quality-based duplicate review (judgment calls)\n"
-        "3. Orphan scan (final sweep for anything left behind)",
+        "3. Orphan scan (final sweep for anything left behind)\n"
+        "4. Tag tracker issues (organizational only, changes nothing)",
         style="magenta",
     ))
     cross_disk_dedupe_flow()
@@ -153,18 +178,21 @@ def run_all():
     dupe_review_flow()
     console.print()
     orphan_scan_flow()
-    console.print(Panel("[bold green]All three done.[/bold green]", style="green"))
+    console.print()
+    tag_tracker_issues_flow()
+    console.print(Panel("[bold green]All four done.[/bold green]", style="green"))
 
 
 MENU = {
     "1": ("Cross-disk duplicate cleanup (cross-disk-dedupe.sh)", cross_disk_dedupe_flow),
     "2": ("Quality-based duplicate review (dupe-review)", dupe_review_flow),
     "3": ("Orphan file scan", orphan_scan_flow),
-    "4": ("Run all three, in the recommended order", run_all),
+    "4": ("Tag tracker issues (trumped/deleted/unregistered/auth)", tag_tracker_issues_flow),
+    "5": ("Run all four, in the recommended order", run_all),
     "q": ("Quit", None),
 }
 
-SUBCOMMANDS = {"cross-disk-dedupe", "dupe-review", "orphan-scan"}
+SUBCOMMANDS = {"cross-disk-dedupe", "dupe-review", "orphan-scan", "tag-tracker-issues"}
 
 
 def run_subcommand(name: str, rest: list[str]):
@@ -178,6 +206,8 @@ def run_subcommand(name: str, rest: list[str]):
         call_module_main("dupe_review", rest)
     elif name == "orphan-scan":
         call_module_main("orphan_scan", rest)
+    elif name == "tag-tracker-issues":
+        run_tag_tracker_issues_sh(apply="--apply" in rest)
 
 
 def print_help():
@@ -186,7 +216,8 @@ def print_help():
         "  mothership.py                          Interactive menu\n"
         "  mothership.py cross-disk-dedupe [--apply]\n"
         "  mothership.py dupe-review [--report-only] [--trash] [--reconcile] [--reset]\n"
-        "  mothership.py orphan-scan [--apply] [--exclude PATH ...]\n\n"
+        "  mothership.py orphan-scan [--apply] [--exclude PATH ...]\n"
+        "  mothership.py tag-tracker-issues [--apply]\n\n"
         "Subcommands run directly with no extra menu prompts — for scripted/cron use (e.g. a\n"
         "scheduled 'mothership.py cross-disk-dedupe --apply' run). Omit the subcommand for\n"
         "the interactive menu."
@@ -214,7 +245,7 @@ def main():
         console.print()
         for key, (label, _) in MENU.items():
             console.print(f"  [bold]{key}[/bold]. {label}")
-        choice = Prompt.ask("\nChoice", choices=list(MENU.keys()), default="4")
+        choice = Prompt.ask("\nChoice", choices=list(MENU.keys()), default="5")
         if choice == "q":
             break
         _, fn = MENU[choice]
