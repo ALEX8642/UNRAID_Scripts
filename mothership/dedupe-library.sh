@@ -209,6 +209,29 @@ process_library() {
     fi
     sorted_file="$matches"
 
+    # If loosefile and sorted_file are still the same hardlinked inode, this is a currently
+    # airing/still-linked title, not a broken-hardlink duplicate: qBittorrent's raw download
+    # sits loose at the library root (no wrapping folder, invisible to Plex) and Sonarr/Radarr
+    # hardlinked it into the organized path Plex actually indexes — both names point at the
+    # SAME data. Deleting the loose name here is unconditionally safe regardless of age or
+    # qBittorrent status: zero bytes freed (the data survives via sorted_file's link),
+    # qBittorrent keeps seeding fine (its inode is untouched), and Plex/Sonarr are unaffected.
+    # Without this check, a currently-airing show's loose entries are always <30 days old and
+    # always actively seeding, so the age/qBittorrent guards below would protect them forever
+    # and this exact case would never get cleaned up.
+    loose_dev_ino=$(stat -c '%d:%i' "$loosefile" 2>/dev/null)
+    sorted_dev_ino=$(stat -c '%d:%i' "$sorted_file" 2>/dev/null)
+    if [ -n "$loose_dev_ino" ] && [ "$loose_dev_ino" = "$sorted_dev_ino" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        log "WOULD DELETE (still-hardlinked to sorted copy, safe regardless of age/seeding): $loosefile"
+      else
+        rm -f -- "$loosefile"
+        log "DELETED (still-hardlinked to sorted copy, safe regardless of age/seeding): $loosefile"
+      fi
+      deleted=$((deleted + 1))
+      continue
+    fi
+
     mtime=$(stat -c '%Y' "$loosefile" 2>/dev/null || echo 0)
     age_days=$(( ( $(date +%s) - mtime ) / 86400 ))
 
