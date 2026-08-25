@@ -866,9 +866,10 @@ def delete_one(rec: FileRecord, to_keep: list[FileRecord], use_trash: bool, run_
     if not rec.path_mapped:
         console.print(f"    [red]Refusing to delete — path doesn't match any known host mount: {rec.path}[/red]")
         return "unmapped"
-    if rec.actively_seeding and file_age_days(rec.path) < PROTECT_AGE_DAYS:
+    if rec.actively_seeding:
+        age_note = f"only {file_age_days(rec.path)}d old — " if file_age_days(rec.path) < PROTECT_AGE_DAYS else ""
         confirm = Prompt.ask(
-            f"    [bold red]⚠ ACTIVE torrent, only {file_age_days(rec.path)}d old — deleting may trigger a hit-and-run.[/bold red] Delete anyway? [y/N]",
+            f"    [bold red]⚠ ACTIVE torrent, {age_note}deleting may trigger a hit-and-run.[/bold red] Delete anyway? [y/N]",
             default="n",
         ).strip().lower()
         if confirm != "y":

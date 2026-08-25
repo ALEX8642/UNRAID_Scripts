@@ -13,6 +13,13 @@
 # PROTECT_AGE_DAYS old AND currently associated with an active torrent in qBittorrent — i.e.
 # something that just landed and might still be settling, rather than stable old backlog.
 #
+# Safety guard: a match is also skipped, permanently, if the loose file and sorted file are
+# still the same hardlinked inode (a currently-airing title where Sonarr/Radarr hardlinked
+# qBittorrent's raw download into the organized tree, rather than moving it). Deleting either
+# name in that case only risks real damage — either breaking qBittorrent's path-based
+# completeness tracking, or deleting Plex's only indexed copy — to reclaim a number that's
+# always exactly zero bytes, since both names point at the same data. Never automate this.
+#
 # Deletion is at individual FILE granularity, never a directory. A TV "unmapped" match is
 # often a season-pack folder whose files share a real Season XX/ folder with other episodes
 # that must not be touched — only the one matched file is removed. Now-empty directories are
@@ -147,7 +154,7 @@ is_in_qbit() {
 # ---- process one library (movies or tv) ----
 process_library() {
   local kind="$1" api_url="$2" api_key="$3" host_root="$4" container_prefix="$5"
-  local deleted=0 skipped_ambiguous=0 skipped_protected=0 freed_bytes=0
+  local deleted=0 skipped_ambiguous=0 skipped_protected=0 skipped_same_inode=0 freed_bytes=0
 
   log "--- $kind: fetching unmapped (unrecognized) items from ${api_url##*/} ---"
   local rootfolder_json
@@ -213,22 +220,23 @@ process_library() {
     # airing/still-linked title, not a broken-hardlink duplicate: qBittorrent's raw download
     # sits loose at the library root (no wrapping folder, invisible to Plex) and Sonarr/Radarr
     # hardlinked it into the organized path Plex actually indexes — both names point at the
-    # SAME data. Deleting the loose name here is unconditionally safe regardless of age or
-    # qBittorrent status: zero bytes freed (the data survives via sorted_file's link),
-    # qBittorrent keeps seeding fine (its inode is untouched), and Plex/Sonarr are unaffected.
-    # Without this check, a currently-airing show's loose entries are always <30 days old and
-    # always actively seeding, so the age/qBittorrent guards below would protect them forever
-    # and this exact case would never get cleaned up.
+    # SAME data.
+    #
+    # DO NOT delete either name here, ever. This was tried (2026-08-24) and caused a real
+    # incident: qBittorrent tracks a torrent's completeness by the PATH it saved to, not by
+    # inode, so deleting loosefile (even though the bytes survive via sorted_file) makes
+    # qBittorrent think its data went missing on the next recheck/restart, and it re-downloads
+    # the entire file. Deleting sorted_file instead would be just as bad in the other
+    # direction: qBittorrent's tracked path matches loosefile, not sorted_file, so once
+    # loosefile ages past PROTECT_AGE_DAYS or stops seeding, the is_in_qbit(sorted_file) guard
+    # below would NOT catch it and this would delete Plex's only indexed copy. Either
+    # direction risks real damage to recover a number that is always exactly zero: both names
+    # point at the same data, so there is nothing to reclaim. Skip and move on.
     loose_dev_ino=$(stat -c '%d:%i' "$loosefile" 2>/dev/null)
     sorted_dev_ino=$(stat -c '%d:%i' "$sorted_file" 2>/dev/null)
     if [ -n "$loose_dev_ino" ] && [ "$loose_dev_ino" = "$sorted_dev_ino" ]; then
-      if [ "$DRY_RUN" -eq 1 ]; then
-        log "WOULD DELETE (still-hardlinked to sorted copy, safe regardless of age/seeding): $loosefile"
-      else
-        rm -f -- "$loosefile"
-        log "DELETED (still-hardlinked to sorted copy, safe regardless of age/seeding): $loosefile"
-      fi
-      deleted=$((deleted + 1))
+      log_detail "SKIP (still-hardlinked to sorted copy, 0 bytes recoverable either way, not touching a qBittorrent-tracked path): $loosefile"
+      skipped_same_inode=$((skipped_same_inode + 1))
       continue
     fi
 
@@ -264,7 +272,7 @@ process_library() {
     find "$host_root" -mindepth 1 -type d -empty -delete 2>/dev/null || true
   fi
 
-  log "--- $kind summary: $deleted deleted, $skipped_ambiguous skipped (ambiguous), $skipped_protected skipped (protected), $(( freed_bytes / 1024 / 1024 / 1024 )) GB $( [ "$DRY_RUN" -eq 1 ] && echo would-be-freed || echo freed ) ---"
+  log "--- $kind summary: $deleted deleted, $skipped_ambiguous skipped (ambiguous), $skipped_protected skipped (protected), $skipped_same_inode skipped (still-hardlinked, 0 bytes recoverable), $(( freed_bytes / 1024 / 1024 / 1024 )) GB $( [ "$DRY_RUN" -eq 1 ] && echo would-be-freed || echo freed ) ---"
 }
 
 main() {
