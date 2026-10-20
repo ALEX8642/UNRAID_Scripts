@@ -13,6 +13,12 @@ PATH_MAP = [
     ("/tv/", "/mnt/user/Media/tv/"),
     ("/arr/movies/", "/mnt/user/Media/arr/movies/"),
     ("/arr/shows/", "/mnt/user/Media/arr/shows/"),
+    # Radarr/Sonarr see everything through one /media mount (= /mnt/user/Media) since the 2026 migration;
+    # this is what makes hardlinked imports work, and it is how they report their file paths.
+    ("/media/Movies/", "/mnt/user/Media/Movies/"),
+    ("/media/tv/", "/mnt/user/Media/tv/"),
+    ("/media/arr/movies/", "/mnt/user/Media/arr/movies/"),
+    ("/media/arr/shows/", "/mnt/user/Media/arr/shows/"),
 ]
 
 
