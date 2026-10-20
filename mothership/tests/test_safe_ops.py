@@ -32,6 +32,19 @@ class RawCopyTests(unittest.TestCase):
             self.assertEqual(raw_copies("/not/user/path", disk_glob=f"{d}/disk[0-9]*"), [])
 
 
+class OtherNamesTests(unittest.TestCase):
+    def test_finds_hardlink_in_arr_tree_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/disk1/Media/Movies/A"); os.makedirs(f"{d}/disk1/Media/arr/movies"); os.makedirs(f"{d}/disk1/Media/other")
+            lib = f"{d}/disk1/Media/Movies/A/a.mkv"
+            with open(lib, "w") as fh: fh.write("x")
+            os.link(lib, f"{d}/disk1/Media/arr/movies/seed.mkv"); os.link(lib, f"{d}/disk1/Media/other/ignored.mkv")
+            self.assertEqual(so.other_names(lib), [f"{d}/disk1/Media/arr/movies/seed.mkv"])
+            solo = f"{d}/disk1/Media/Movies/A/solo.mkv"
+            with open(solo, "w") as fh: fh.write("y")
+            self.assertEqual(so.other_names(solo), [])
+
+
 class ClassifyTests(unittest.TestCase):
     RAW = ["/mnt/disk1/Media/Movies/A/a.mkv"]
 

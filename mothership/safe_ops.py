@@ -52,6 +52,23 @@ def file_identity(path: str) -> tuple:
     return (st.st_dev, st.st_ino, st.st_nlink)
 
 
+def other_names(raw_path: str, subdirs=("Media/arr",)) -> list:
+    """Other hardlink names of the same file on the SAME physical disk, searched only under the given
+    subdirectories of that disk (e.g. the arr/ download tree where Radarr/Sonarr seeds live)."""
+    import subprocess
+    st = os.stat(raw_path)
+    if st.st_nlink < 2 or "/Media/" not in raw_path:
+        return []
+    root = raw_path.split("/Media/", 1)[0]
+    found = []
+    for sub in subdirs:
+        d = os.path.join(root, sub)
+        if os.path.isdir(d):
+            out = subprocess.run(["find", d, "-xdev", "-type", "f", "-inum", str(st.st_ino)], capture_output=True, text=True).stdout
+            found += [l for l in out.splitlines() if l and l != raw_path]
+    return found
+
+
 @dataclass
 class TorrentInfo:
     hash: str

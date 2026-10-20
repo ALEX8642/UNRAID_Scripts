@@ -18,6 +18,13 @@ Data sources:
 
 This tool never deletes anything on its own. Every group requires an explicit interactive
 choice: keep one file, keep several, or keep all (do nothing).
+
+Safety model (see safe_ops.py): DRY RUN by default - your choices are written to a plan file and nothing
+changes. `--apply` runs each removal after a y/N prompt; `--execute PLAN.json [--apply]` re-validates a saved
+plan against the current state and runs it. Removals never go through /mnt/user: library-only files are
+unlinked on the physical disk, seeded files go through qBittorrent's API, and a seed that may still be
+inside a tracker's hit-and-run window is only tagged `delete-later` (its Plex-visible hardlink name is
+removed, the seed keeps seeding). Hardlinked names of the same data are flagged in the table.
 """
 
 import hashlib
@@ -41,6 +48,8 @@ from rich.prompt import Prompt
 from rich import box
 
 from common import PATH_MAP, to_host_path
+import safe_ops
+from safe_ops import TorrentInfo, classify_removal, raw_copies
 
 # ==== CONFIG — non-secret settings, edit directly for your setup ====
 PLEX_DB = (
@@ -56,7 +65,11 @@ PLEX_DB = (
 PLEX_LIBRARY_SECTION_IDS = [1, 2]
 
 LOGFILE = "/logs/dupe-review.log"
-STATE_FILE = "/logs/dupe-review-state.json"
+# Dry-run is the default: choices are recorded in a plan file and nothing is changed. --apply executes immediately;
+# --execute PLAN.json --apply re-validates and runs a saved plan. A separate state file keeps dry-run answers apart.
+APPLY = "--apply" in sys.argv
+STATE_FILE = "/logs/dupe-review-state.json" if APPLY else "/logs/dupe-review-plan-state.json"
+PLAN_DIR = "/logs"
 
 # Only require an extra confirmation before deleting an actively-seeding file if it's younger
 # than this. Anything older is well past any realistic hit-and-run window, so it deletes with
@@ -131,6 +144,10 @@ class FileRecord:
     season_key: str = ""  # "<show>::S<NN>" for episodes, "" for movies — used to batch a season
     torrent_hash: str = ""  # qBittorrent hash this file belongs to, if any
     arr_id: int = 0  # Radarr movieId / Sonarr seriesId, if tracked_by is Radarr/Sonarr
+    raw: list = field(default_factory=list)   # physical /mnt/diskN copies of this path
+    nlink: int = 0                             # hardlink count (0 = unknown)
+    ident: tuple = ()                          # (device, inode) of the physical file
+    same_as: int = 0                           # 1-based index of an earlier version that is the SAME data (hardlink)
 
 
 def open_plex_db():
@@ -353,8 +370,14 @@ def enrich_with_arr(rec: FileRecord, radarr_idx: dict, sonarr_idx: dict):
 # qBittorrent active-seeding index (hit-and-run guard)
 # ---------------------------------------------------------------------------
 
+QBIT_SESSION = None
+QBIT_TORRENTS: dict = {}
+QBIT_INDEX: dict = {}
+
+
 def load_qbit_index() -> dict:
     """host path (file or folder) -> torrent hash, for every torrent's content_path."""
+    global QBIT_SESSION, QBIT_TORRENTS
     s = requests.Session()
     login = s.post(f"{QBIT_URL}/api/v2/auth/login", data={"username": QBIT_USER, "password": QBIT_PASS}, timeout=15)
     if login.status_code != 200 or login.text.strip() != "Ok.":
@@ -362,6 +385,8 @@ def load_qbit_index() -> dict:
         return {}
     r = s.get(f"{QBIT_URL}/api/v2/torrents/info", timeout=30)
     r.raise_for_status()
+    QBIT_SESSION = s
+    QBIT_TORRENTS = {t["hash"]: t for t in r.json()}
     degenerate = {prefix.rstrip("/") for prefix, _ in PATH_MAP}
     index = {}
     for t in r.json():
@@ -395,6 +420,7 @@ def load_qbit_index() -> dict:
             continue
         for f in rr.json():
             index[os.path.join(save_path, f["name"])] = h
+    QBIT_INDEX.update(index)
     return index
 
 
@@ -639,7 +665,19 @@ def build_groups(radarr_idx, sonarr_idx, qbit_index, progress, task):
         h = torrent_hash_for(rec.path, qbit_index)
         rec.actively_seeding = h is not None
         rec.torrent_hash = h or ""
+        rec.raw = raw_copies(rec.path)
+        if len(rec.raw) == 1 and os.path.exists(rec.raw[0]):
+            dev, ino, nl = safe_ops.file_identity(rec.raw[0])
+            rec.ident, rec.nlink = (dev, ino), nl
         groups.setdefault(rec.group_key, []).append(rec)
+    for recs in groups.values():          # versions that are literally the same data under two names
+        seen = {}
+        for i, rec in enumerate(recs, start=1):
+            if rec.ident:
+                if rec.ident in seen:
+                    rec.same_as = seen[rec.ident]
+                else:
+                    seen[rec.ident] = i
     return groups
 
 
@@ -730,7 +768,8 @@ def render_group(console: Console, title: str, recs: list[FileRecord], suggested
     console.print(table)
     for i, rec in enumerate(recs, start=1):
         unmapped_note = "  [bold red]⚠ unrecognized mount — cannot be deleted by this tool[/bold red]" if not rec.path_mapped else ""
-        console.print(f"  [{i}] [dim]{rec.path}[/dim]{unmapped_note}")
+        link_note = f"  [yellow]⇄ same data as [{rec.same_as}] (hardlink) - deleting one name frees no space[/yellow]" if rec.same_as else (f"  [dim](hardlinked x{rec.nlink})[/dim]" if rec.nlink > 1 else "")
+        console.print(f"  [{i}] [dim]{rec.path}[/dim]{unmapped_note}{link_note}")
     if suggested is not None:
         console.print(f"  [dim]★ suggested keep (based on Radarr/Sonarr score, then resolution, then HDR/DV, then size — advisory only)[/dim]")
     else:
@@ -773,57 +812,40 @@ def state_key(key: str, recs: list[FileRecord]) -> str:
 
 
 def reconcile_arr(kept: FileRecord, deleted_tracked: FileRecord) -> None:
-    """Best-effort: when the file Radarr/Sonarr was tracking gets deleted in favor of a loose
-    one, that app now thinks the movie/episode is missing and may re-grab it. Ask it to
-    manually import the kept file instead, so it goes back to tracking a real file. Failures
-    here are logged and shown but never block the deletion that already happened."""
+    """After removing the file Radarr/Sonarr was tracking: point the app at the file that was kept and
+    rescan, so it tracks a real file again. Never searches or grabs. Dry-run unless --apply.
+    Radarr: movie path -> the kept file's folder (PUT ?moveFiles=false) then RescanMovie.
+    Sonarr: RescanSeries (the kept file must live under the series folder to be picked up)."""
     if not deleted_tracked.arr_id:
         return
-    kind = deleted_tracked.group_kind
-    base_url = RADARR_URL if kind == "movie" else SONARR_URL
-    api_key = RADARR_KEY if kind == "movie" else SONARR_KEY
-    id_param = "movieId" if kind == "movie" else "seriesId"
-    folder = os.path.dirname(kept.path)
+    movie = deleted_tracked.group_kind == "movie"
+    base, key = (RADARR_URL, RADARR_KEY) if movie else (SONARR_URL, SONARR_KEY)
+    hdr = {"X-Api-Key": key}
+    app = deleted_tracked.tracked_by
     try:
-        r = requests.get(
-            f"{base_url}/api/v3/manualimport",
-            headers={"X-Api-Key": api_key},
-            params={"folder": folder, id_param: deleted_tracked.arr_id, "filterExistingFiles": "false"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        candidates = r.json()
-        if not isinstance(candidates, list):
-            # Radarr/Sonarr returns a {"message": ...} error object (not a list) for various
-            # failures — a stale movie/series record, a folder it can't read, etc.
-            msg = candidates.get("message", candidates) if isinstance(candidates, dict) else candidates
-            console.print(f"    [yellow]{deleted_tracked.tracked_by} manual-import lookup failed: {msg}. Check manually if this title shows as missing.[/yellow]")
-            log(f"RECONCILE FAILED (manualimport returned non-list) for {kept.path}: {msg}")
-            return
-    except requests.RequestException as e:
-        console.print(f"    [yellow]Couldn't ask {deleted_tracked.tracked_by} to re-import the kept file: {e}. Check it manually if this title shows as missing.[/yellow]")
-        log(f"RECONCILE FAILED (manualimport lookup) for {kept.path}: {e}")
-        return
-
-    match = next((c for c in candidates if c.get("path") == kept.path), None)
-    if not match or not match.get("quality") or match["quality"].get("quality", {}).get("id", 0) == 0:
-        console.print(f"    [yellow]{deleted_tracked.tracked_by} couldn't confidently parse the kept file for re-import — check manually if this title shows as missing.[/yellow]")
-        log(f"RECONCILE SKIPPED (no confident parse) for {kept.path}")
-        return
-
-    try:
-        r = requests.post(
-            f"{base_url}/api/v3/command",
-            headers={"X-Api-Key": api_key},
-            json={"name": "ManualImport", "files": [match], "importMode": "auto"},
-            timeout=30,
-        )
-        r.raise_for_status()
-        console.print(f"    [green]Asked {deleted_tracked.tracked_by} to import the kept file so it's tracked again.[/green]")
-        log(f"RECONCILED: {kept.path} imported into {deleted_tracked.tracked_by} for {id_param}={deleted_tracked.arr_id}")
-    except requests.RequestException as e:
-        console.print(f"    [yellow]{deleted_tracked.tracked_by} import request failed: {e}. Check manually if this title shows as missing.[/yellow]")
-        log(f"RECONCILE FAILED (import command) for {kept.path}: {e}")
+        if movie:
+            m = requests.get(f"{base}/api/v3/movie/{deleted_tracked.arr_id}", headers=hdr, timeout=30).json()
+            kept_dir = os.path.dirname(kept.path)
+            rel = kept_dir.split("/mnt/user/Media/", 1)[1] if "/mnt/user/Media/" in kept_dir else ""
+            new_path = "/media/" + rel
+            if rel in ("", "Movies"):
+                console.print(f"    [yellow]{app}: the kept file is a bare file at the library root - move it into a Title (Year) folder first, then rescan. Not changed.[/yellow]")
+                return
+            if m.get("path") != new_path:
+                console.print(f"    [cyan]{app}: {'repoint' if APPLY else 'WOULD repoint'} movie path {m.get('path')} -> {new_path}[/cyan]")
+                if APPLY:
+                    m["path"] = new_path
+                    requests.put(f"{base}/api/v3/movie/{deleted_tracked.arr_id}", headers=hdr, params={"moveFiles": "false"}, json=m, timeout=60).raise_for_status()
+            if APPLY:
+                requests.post(f"{base}/api/v3/command", headers=hdr, json={"name": "RescanMovie", "movieIds": [deleted_tracked.arr_id]}, timeout=30).raise_for_status()
+        else:
+            console.print(f"    [cyan]{app}: {'rescan' if APPLY else 'WOULD rescan'} series {deleted_tracked.arr_id} (kept file must be under the series folder)[/cyan]")
+            if APPLY:
+                requests.post(f"{base}/api/v3/command", headers=hdr, json={"name": "RescanSeries", "seriesId": deleted_tracked.arr_id}, timeout=30).raise_for_status()
+        log(f"RECONCILE {'APPLIED' if APPLY else 'PLANNED'}: {app} id={deleted_tracked.arr_id} kept={kept.path}")
+    except (requests.RequestException, KeyError, ValueError) as e:
+        console.print(f"    [yellow]{app} reconcile failed: {e}. Check manually.[/yellow]")
+        log(f"RECONCILE FAILED {app} id={deleted_tracked.arr_id}: {e}")
 
 
 def plex_refresh_and_empty_trash() -> None:
@@ -856,42 +878,97 @@ def plex_refresh_and_empty_trash() -> None:
         console.print("[green]Plex library refreshed and trash emptied for Movies/TV.[/green]")
 
 
-def trash_path_for(rec: FileRecord, run_stamp: str) -> str:
-    safe_name = rec.path.strip("/").replace("/", "__")
-    return os.path.join(TRASH_DIR, run_stamp, safe_name)
+PLAN: list = []
 
 
-def delete_one(rec: FileRecord, to_keep: list[FileRecord], use_trash: bool, run_stamp: str) -> str:
-    """Deletes (or trashes) rec.path, printing its own status line. Returns 'deleted', 'declined'
-    (user chose not to touch an actively-seeding file), 'unmapped', or 'error'."""
-    if not rec.path_mapped:
-        console.print(f"    [red]Refusing to delete — path doesn't match any known host mount: {rec.path}[/red]")
-        return "unmapped"
-    if rec.actively_seeding:
-        age_note = f"only {file_age_days(rec.path)}d old — " if file_age_days(rec.path) < PROTECT_AGE_DAYS else ""
-        confirm = Prompt.ask(
-            f"    [bold red]⚠ ACTIVE torrent, {age_note}deleting may trigger a hit-and-run.[/bold red] Delete anyway? [y/N]",
-            default="n",
-        ).strip().lower()
-        if confirm != "y":
-            console.print("    [yellow]Skipped that file.[/yellow]")
-            return "declined"
+def qbit_n_files(h: str) -> int:
     try:
-        if use_trash:
-            dest = trash_path_for(rec, run_stamp)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            shutil.move(rec.path, dest)
-            log(f"TRASHED: {rec.path} -> {dest} (kept: {[r.path for r in to_keep]})")
-            console.print(f"    [green]Moved to trash:[/green] {dest}")
-        else:
-            os.remove(rec.path)
-            log(f"DELETED: {rec.path} (kept: {[r.path for r in to_keep]})")
-            console.print(f"    [green]Deleted.[/green]")
-        return "deleted"
-    except OSError as e:
-        console.print(f"    [red]Failed to delete {rec.path}: {e}[/red]")
-        log(f"FAILED to delete {rec.path}: {e}")
+        r = QBIT_SESSION.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
+        return len(r.json())
+    except Exception:
+        return 999          # unknown -> treated as a pack -> refused
+
+
+def torrent_for(rec) -> Optional[TorrentInfo]:
+    """The torrent that owns rec's data: either rec's own tracked name, or - for a hardlinked LIBRARY name -
+    a seed kept under arr/ (found through the shared inode). None if no torrent claims the data."""
+    if QBIT_SESSION is None:
+        return None
+    h = torrent_hash_for(rec.path, QBIT_INDEX)
+    exact = True
+    if not h and len(rec.raw) == 1 and rec.nlink > 1:
+        for n in safe_ops.other_names(rec.raw[0]):
+            host = "/mnt/user/" + n.split("/", 3)[3]
+            h = torrent_hash_for(host, QBIT_INDEX)
+            if h:
+                exact = False
+                break
+    if not h:
+        return None
+    t = QBIT_TORRENTS.get(h, {})
+    return TorrentInfo(hash=h, name=t.get("name", h), seed_days=(t.get("seeding_time", 0) or 0) / 86400.0,
+                       category=t.get("category", ""), n_files=qbit_n_files(h), covers_exact_path=exact)
+
+
+def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) -> str:
+    """Decide how to remove `rec` (safe_ops.classify_removal), record it in the plan and - only with --apply, after a
+    y/N confirmation - execute it. Returns 'planned' (dry run), 'deleted', 'tagged' (kept seeding + tagged), 'declined', 'error'."""
+    if not rec.path_mapped:
+        console.print(f"    [red]Refusing - path doesn't match any known host mount: {rec.path}[/red]")
+        return "unmapped"
+    keeper_raws = [k.raw[0] for k in to_keep if len(k.raw) == 1]
+    kr = rec.raw[0] if rec.raw and rec.raw[0] in keeper_raws else ""
+    tinfo = torrent_for(rec)
+    dec = classify_removal(rec.raw, tinfo, keeper_raw=kr)
+    seed_note = f" (torrent '{tinfo.name[:40]}', seeded {tinfo.seed_days:.1f}d, {'own name' if tinfo.covers_exact_path else 'seed kept under arr/'})" if tinfo else ""
+    console.print(f"    [bold]{dec.mode}[/bold] - {dec.reason}{seed_note}")
+    PLAN.append(dict(title=rec.group_title, kind=rec.group_kind, loser=rec.path, keep=[k.path for k in to_keep], mode=dec.mode,
+                     torrent=dec.torrent_hash, arr=rec.tracked_by, arr_id=rec.arr_id, size=rec.size))
+    if dec.mode == "REFUSE":
+        log(f"REFUSED {rec.path}: {dec.reason}")
         return "error"
+    if APPLY:
+        ans = Prompt.ask("    Execute this removal? [y/N]", default="n").strip().lower()
+        if ans != "y":
+            console.print("    [yellow]Skipped.[/yellow]")
+            return "declined"
+    for line in safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"dupe-review keep={[k.path for k in to_keep]}"):
+        console.print(f"      {line}")
+    removed = bool(dec.unlink_raw or dec.delete_torrent)
+    if not APPLY:
+        return "planned" if removed else "tagged"
+    return "deleted" if removed else "tagged"
+
+
+def execute_plan(path: str) -> None:
+    """Re-validate and run a plan written by a dry-run review. Every action is re-classified against the CURRENT
+    state; anything that changed since planning is skipped, not guessed at. Dry-run unless --apply."""
+    from types import SimpleNamespace
+    actions = json.load(open(path))
+    console.print(Panel(f"Plan {path}: {len(actions)} action(s) - {'APPLY' if APPLY else 'DRY RUN (add --apply to execute)'}", style="magenta"))
+    load_qbit_index()
+    done = 0
+    for a in actions:
+        raw = raw_copies(a["loser"])
+        nl = safe_ops.file_identity(raw[0])[2] if len(raw) == 1 and os.path.exists(raw[0]) else 0
+        r = SimpleNamespace(path=a["loser"], raw=raw, nlink=nl)
+        keeper_raws = [c[0] for c in (raw_copies(k) for k in a["keep"]) if len(c) == 1]
+        if not keeper_raws or len(keeper_raws) != len(a["keep"]):
+            console.print(f"  [yellow]SKIP {a['title']}: a kept file is missing now - not removing anything[/yellow]")
+            continue
+        dec = classify_removal(raw, torrent_for(r), keeper_raw=raw[0] if raw and raw[0] in keeper_raws else "")
+        if dec.mode != a["mode"]:
+            console.print(f"  [yellow]SKIP {a['title']}: state changed since planning (was {a['mode']}, now {dec.mode}: {dec.reason})[/yellow]")
+            continue
+        console.print(f"  [bold]{a['title']}[/bold]: {dec.mode}")
+        for line in safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"plan {os.path.basename(path)}"):
+            console.print(f"      {line}")
+        if a.get("arr") in ("Radarr", "Sonarr") and len(a["keep"]) == 1 and (dec.unlink_raw or dec.delete_torrent):
+            reconcile_arr(SimpleNamespace(path=a["keep"][0]), SimpleNamespace(group_kind=a["kind"], arr_id=a["arr_id"], tracked_by=a["arr"]))
+        done += 1
+    if APPLY and done:
+        plex_refresh_and_empty_trash()
+    console.print(f"[bold]{done}[/bold] action(s) {'executed' if APPLY else 'validated (dry run)'}.")
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1055,9 @@ def render_season_cluster(cluster: dict, position_label: str = ""):
 
 
 def main():
+    if "--execute" in sys.argv:
+        execute_plan(sys.argv[sys.argv.index("--execute") + 1])
+        return
     report_only = "--report-only" in sys.argv
     reset = "--reset" in sys.argv
     use_trash = "--trash" in sys.argv
@@ -1007,7 +1087,8 @@ def main():
 
     console.print(f"\n[bold]{len(groups)}[/bold] titles have more than one version in your library.\n")
     if use_trash:
-        console.print(f"[dim]--trash active: deletions move to {TRASH_DIR}/<run> instead of being removed outright. Not auto-cleaned — that's on you.[/dim]\n")
+        console.print("[dim]--trash is retired: removals now go through safe_ops (raw-disk unlink / qBittorrent API) and are dry-run by default.[/dim]\n")
+    console.print(f"[bold]{'APPLY mode - each removal asks for y/N before it runs.' if APPLY else 'DRY RUN - choices are recorded in a plan; nothing is changed. Add --apply to execute as you go, or run a saved plan with --execute PLAN.json --apply.'}[/bold]\n")
     if use_reconcile:
         console.print("[dim]--reconcile active: keeping a loose file over a Radarr/Sonarr-tracked one will ask that app to import the kept file. Skip this flag if you'd rather that title's record stay stale (stops automatic search from re-grabbing it).[/dim]\n")
 
@@ -1091,12 +1172,12 @@ def main():
                 continue
             to_keep, to_delete = ([side_a], [side_b]) if choice == "a" else ([side_b], [side_a])
             outcome = delete_one(to_delete[0], to_keep, use_trash, run_stamp)
-            if outcome == "deleted":
+            if outcome in ("deleted", "planned"):
                 total_deleted += 1
                 total_freed += to_delete[0].size
                 done.add(sk)
                 maybe_reconcile(to_keep, to_delete[0])
-            elif outcome == "declined":
+            elif outcome in ("declined", "tagged"):
                 done.add(sk)
             else:
                 cluster_failure = True
@@ -1159,7 +1240,7 @@ def main():
         had_failure = False
         for rec in to_delete:
             outcome = delete_one(rec, to_keep, use_trash, run_stamp)
-            if outcome == "deleted":
+            if outcome in ("deleted", "planned"):
                 total_deleted += 1
                 total_freed += rec.size
                 maybe_reconcile(to_keep, rec)
@@ -1174,12 +1255,16 @@ def main():
         save_state(done)
         console.print()
 
-    if not report_only and total_deleted > 0:
+    if APPLY and not report_only and total_deleted > 0:
         console.print()
         plex_refresh_and_empty_trash()
+    if PLAN and not APPLY:
+        plan_path = f"{PLAN_DIR}/dupe-review-plan-{run_stamp}.json"
+        safe_ops.save_plan(plan_path, PLAN)
+        console.print(f"[bold green]DRY RUN: nothing was changed.[/bold green] {len(PLAN)} planned action(s) saved to {plan_path}\n  Validate:  ./run.sh review --execute {plan_path}\n  Execute:   ./run.sh review --execute {plan_path} --apply")
 
     console.print(Panel(
-        f"Deleted: {total_deleted} files, freed {fmt_size(total_freed)}\n"
+        f"{'Removed' if APPLY else 'Planned (dry run)'}: {total_deleted} files, {'freed' if APPLY else 'would free'} {fmt_size(total_freed)}\n"
         f"Kept-both/skipped: {kept_all}\n\n"
         + ("[bold]Remember:[/bold] run a Plex library scan + Empty Trash to stop these from showing as duplicate versions." if not PLEX_TOKEN or report_only or total_deleted == 0 else "Plex was refreshed automatically above."),
         title="Session summary", style="cyan",
