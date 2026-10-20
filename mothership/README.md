@@ -1,8 +1,16 @@
+# mothership: Plex library maintenance tools
 
-## Added 2026-10-20
+Everything here is **dry-run by default** and never writes through `/mnt/user` (Unraid's FUSE layer); destructive actions resolve to the physical `/mnt/diskN` path. Full background is in the repo root `README.md`. Credentials live in `.env` (copy `.env.example`; never commit it).
 
-- `hnr_guard.py` — unmonitors library files that are still a young seed (torrent lives in the library, not in `arr/`) so Radarr/Sonarr never delete them on upgrade inside a hit-and-run window; re-monitors them when the window passes. Dry-run by default (`--apply` to act). State: `logs/hnr_guard_state.json`. Run: `docker run --rm --network host --env-file .env -v $PWD/hnr_guard.py:/app/hnr_guard.py -v $PWD/logs:/logs --entrypoint python3 plex-mothership /app/hnr_guard.py [--apply]`.
-- `fix-library-perms.sh` — Radarr/Sonarr run as `nobody` (PUID 99); any library directory created as root blocks their deletes/upgrades. This sets `nobody:users`, dirs 777, files rw on the raw disks (dry-run default, `--apply`). Any script that creates library directories must do the same.
+| Tool | What it does | How to run |
+|---|---|---|
+| `run.sh` / `mothership.py` | Menu that launches the tools below inside the `plex-mothership` image | `./run.sh` |
+| `cross-disk-dedupe.sh` | Finds the same file stored on two array disks at one library path | `./cross-disk-dedupe.sh` (report), `--apply` to remove the extra copy |
+| `dupe_review.py` | Review titles that exist as more than one real file (quality/source); writes a plan to `logs/`, nothing is deleted until you confirm | `mothership.py dupe-review [--report-only] [--apply]`, `--execute PLAN [--apply]`, `--reconcile` |
+| `orphan_scan.py` | Lists video files that neither Plex nor qBittorrent knows about (report only unless `--apply`; never touches hardlinked files) | `mothership.py orphan-scan [--apply]` |
+| `tag-tracker-issues.sh` | Tags torrents with tracker problems (trumped, deleted, unregistered, auth) so you can filter them in qBittorrent; only adds/removes tags | nightly User Script `mothership_tag_tracker_issues`; `--apply` to write |
+| `hnr_guard.py` | Unmonitors a Radarr movie / Sonarr episode while its file is a library-owned seed that has not met the tracker rule (BHD: 120 h or 1:1), so an upgrade cannot delete it; re-monitors when the rule is met | User Script `mothership_hnr_guard` (set a daily schedule); manual: `docker run --rm --network host --env-file .env -v $PWD/hnr_guard.py:/app/hnr_guard.py -v $PWD/logs:/logs --entrypoint python3 plex-mothership /app/hnr_guard.py [--apply]`. Extra torrents to protect: one name fragment per line in `hnr_extra.txt` |
+| `fix-library-perms.sh` | Sets library directories to `nobody:users` 777 and files rw on the raw disks (Radarr/Sonarr run as `nobody`; root-owned folders block their deletes and upgrades) | `./fix-library-perms.sh` (dry run), `--apply`. Any script that creates library folders must do the same |
+| `safe_ops.py` | Shared safety layer used by the tools above (raw-disk unlinks, seeds handled through qBittorrent) | library, not run directly; tests: `python3 -m unittest discover -s tests` |
 
-## Kometa poster helpers
-See `../kometa/README.md` (`set-poster.sh`, `repick-poster.sh`).
+Kometa poster helpers are documented in `../kometa/README.md`.
