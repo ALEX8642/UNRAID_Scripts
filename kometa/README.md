@@ -23,6 +23,9 @@ Choose the new poster in Plex first. The script deletes Kometa's saved original 
 
 ## Running Kometa by hand
 ```
-docker exec -d -u abc kometa sh -c "cd /config && /lsiopy/bin/python /app/kometa/kometa.py --run --collections-only --run-libraries Movies --config /config/config.yml"
+docker exec -d -u abc kometa sh -c "cd /app/kometa && /lsiopy/bin/python kometa.py --run --collections-only --run-libraries Movies --config /config/config.yml"
 ```
 Drop `--collections-only` for a full run (operations, collections, overlays). Logs: `/mnt/docker/kometa/logs/meta.log`. The container runs a nightly schedule on its own (04:15).
+
+## Paths in `config.yml` must be absolute
+The container only mounts `/config`, so a relative `config/...` path (collection files, fonts, assets, report paths) resolves under `/app/kometa/config` and silently fails ("File does not exist"). Use `/config/...` everywhere, and start manual runs from `/app/kometa` as shown above.
