@@ -1,4 +1,12 @@
 #!/bin/bash
+# ############################################################################
+# ARCHIVED 2026-10 - DO NOT RUN. Retired after the 2026-08-25 incident: deleting one
+# name of a hardlinked pair made qBittorrent (which tracks completeness by PATH) think its
+# data vanished and re-download 19+ files. Superseded by mothership/ (dry-run, raw-disk,
+# qBit-aware) and by the library-cleanup migration. Kept only as a record of the old approach.
+# ############################################################################
+echo "dedupe_library.sh is archived and disabled - see archive/README.md" >&2
+exit 1
 # dedupe-library.sh
 #
 # Finds titles that exist BOTH as a loose/unsorted file (tracked by qBittorrent, tucked

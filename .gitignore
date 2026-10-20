@@ -1,2 +1,5 @@
 **/.env
 mothership/logs/
+__pycache__/
+*.pyc
+*:Zone.Identifier
