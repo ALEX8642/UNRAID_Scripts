@@ -27,6 +27,7 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeEl
 from rich import box
 
 from common import to_host_path
+import safe_ops
 
 # ==== CONFIG — non-secret settings, edit directly for your setup ====
 PLEX_DB = (
@@ -134,11 +135,6 @@ def fmt_size(n: int) -> str:
     return f"{n / (1024**3):.2f} GB"
 
 
-def sweep_empty_dirs():
-    for root in (MOVIES_HOST_ROOT, TV_HOST_ROOT):
-        subprocess.run(["find", root, "-mindepth", "1", "-type", "d", "-empty", "-delete"], check=False)
-
-
 def main():
     apply = "--apply" in sys.argv
     exclude = set()
@@ -202,6 +198,7 @@ def main():
     if apply:
         table.add_column("Result")
 
+    removed_raw = []
     total_size = 0
     recent_count = 0
     deleted_count = 0
@@ -227,12 +224,23 @@ def main():
         elif recent:
             result = "[yellow]skipped (recent)[/yellow]"
         else:
+            # Never write through /mnt/user: resolve the physical disk copy and unlink it there. Refuse anything
+            # that is hardlinked elsewhere (shared data: some other name, e.g. a seed in arr/, still needs it)
+            # or that exists on more than one disk (needs cross-disk-dedupe first).
+            raw = safe_ops.raw_copies(path)
             try:
-                os.remove(path)
-                result = "[green]deleted[/green]"
-                deleted_count += 1
-                deleted_size += size
-                log(f"DELETED: {path} ({fmt_size(size)})")
+                if len(raw) != 1:
+                    result = f"[yellow]skipped ({len(raw)} physical copies)[/yellow]"
+                    log(f"SKIPPED {path}: {len(raw)} physical copies")
+                elif safe_ops.file_identity(raw[0])[2] > 1:
+                    result = "[yellow]skipped (hardlinked elsewhere)[/yellow]"
+                    log(f"SKIPPED {path}: hardlinked elsewhere")
+                else:
+                    safe_ops.unlink_raw(raw, True, LOGFILE, "orphan-scan")
+                    removed_raw.append(raw[0])
+                    result = "[green]deleted[/green]"
+                    deleted_count += 1
+                    deleted_size += size
             except OSError as e:
                 result = f"[red]failed: {e}[/red]"
                 failed_count += 1
@@ -242,7 +250,8 @@ def main():
     console.print(table)
 
     if apply:
-        sweep_empty_dirs()
+        for d in safe_ops.prune_empty_parents(removed_raw, logfile=LOGFILE):
+            log(f"PRUNED empty folder {d}")
         console.print(
             f"\n[bold]Deleted {deleted_count} file(s), freed {fmt_size(deleted_size)}.[/bold]  "
             f"Skipped {recent_count} recent, {excluded_count} excluded, {failed_count} failed."

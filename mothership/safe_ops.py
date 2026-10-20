@@ -162,6 +162,28 @@ def unlink_raw(paths: list, apply: bool, logfile: str = "", why: str = "") -> li
     return out
 
 
+def prune_empty_parents(removed_paths: list, stop_at=("Movies", "tv"), apply: bool = True, logfile: str = "") -> list:
+    """After removing files, rmdir (never rm -r) the now-empty parent folders of exactly those files, walking up but
+    stopping at a library root (.../Media/Movies or .../Media/tv) and at the first non-empty folder. Folders that
+    were already empty before (e.g. Radarr's placeholder folders for movies still waiting on a download) are never
+    touched, because only parents of just-removed files are considered."""
+    pruned = []
+    for p in removed_paths:
+        d = os.path.dirname(p)
+        while d and os.path.basename(d) not in stop_at and "/Media/" in d + "/":
+            try:
+                if os.listdir(d):
+                    break
+                if apply:
+                    os.rmdir(d)
+                    _log(logfile, f"RMDIR {d} (emptied by the removal)")
+                pruned.append(d)
+            except OSError:
+                break
+            d = os.path.dirname(d)
+    return pruned
+
+
 def qbit_tag(session, base_url: str, hash_: str, apply: bool, logfile: str = "", tag: str = TAG_DELETE_LATER) -> str:
     if not apply:
         return "would tag"

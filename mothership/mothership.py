@@ -130,15 +130,15 @@ def dupe_review_flow():
         argv.append("--report-only")
     else:
         if Confirm.ask(
-            "\nWhen you choose to delete a file, move it to logs/trash/ instead of deleting "
-            "it outright, so you can still recover it if you change your mind?",
+            "\nDRY RUN is the default: your choices are saved to a plan file and nothing is "
+            "changed. Execute each removal as you go instead (it still asks y/N every time)?",
             default=False,
         ):
-            argv.append("--trash")
+            argv.append("--apply")
         if Confirm.ask(
-            "\nAfter you keep a file, also ask Radarr/Sonarr to re-import it so it's tracked "
-            "again? (Leave this off if you're relying on the old, untracked record to stop "
-            "an automatic re-download)",
+            "\nAfter a removal, point Radarr/Sonarr at the file you kept and rescan so it's tracked "
+            "again (never searches or grabs)? (Leave this off if you're relying on a stale record "
+            "to stop an automatic re-download)",
             default=False,
         ):
             argv.append("--reconcile")
@@ -215,7 +215,8 @@ def print_help():
         "[bold]Usage:[/bold]\n"
         "  mothership.py                          Interactive menu\n"
         "  mothership.py cross-disk-dedupe [--apply]\n"
-        "  mothership.py dupe-review [--report-only] [--trash] [--reconcile] [--reset]\n"
+        "  mothership.py dupe-review [--report-only] [--apply] [--reconcile] [--reset]\n"
+        "  mothership.py dupe-review --execute PLAN.json [--apply]   (re-validate / run a saved dry-run plan)\n"
         "  mothership.py orphan-scan [--apply] [--exclude PATH ...]\n"
         "  mothership.py tag-tracker-issues [--apply]\n\n"
         "Subcommands run directly with no extra menu prompts — for scripted/cron use (e.g. a\n"

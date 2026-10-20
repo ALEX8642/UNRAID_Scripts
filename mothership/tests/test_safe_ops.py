@@ -45,6 +45,22 @@ class OtherNamesTests(unittest.TestCase):
             self.assertEqual(so.other_names(solo), [])
 
 
+class PruneTests(unittest.TestCase):
+    def test_prunes_only_emptied_parents_and_stops_at_library_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = f"{d}/disk1/Media/Movies"
+            os.makedirs(f"{root}/Gone (2020)/extras"); os.makedirs(f"{root}/Keep (2021)"); os.makedirs(f"{root}/Placeholder (2022)")
+            a = f"{root}/Gone (2020)/extras/x.mkv"; b = f"{root}/Keep (2021)/y.mkv"; c = f"{root}/Keep (2021)/z.mkv"
+            for f in (a, b, c):
+                with open(f, "w") as fh: fh.write("x")
+            os.remove(a); os.remove(b)
+            pruned = so.prune_empty_parents([a, b])
+            self.assertEqual(sorted(p.split("Movies/")[1] for p in pruned), ["Gone (2020)", "Gone (2020)/extras"])
+            self.assertTrue(os.path.isdir(f"{root}/Keep (2021)"))          # still holds z.mkv
+            self.assertTrue(os.path.isdir(f"{root}/Placeholder (2022)"))   # pre-existing empty folder untouched
+            self.assertTrue(os.path.isdir(root))                            # library root never removed
+
+
 class ClassifyTests(unittest.TestCase):
     RAW = ["/mnt/disk1/Media/Movies/A/a.mkv"]
 
