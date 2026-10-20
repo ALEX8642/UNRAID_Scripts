@@ -8,7 +8,7 @@ only a hardlink), the delete kills the seed. Inside a tracker's hit-and-run wind
 
 What it does (dry-run unless --apply):
   * Finds qBittorrent torrents whose data lives in the library (save_path not under /arr) and that have
-    seeded for fewer than HNR_MIN_SEED_DAYS (default 30), or whose name is listed in hnr_extra.txt
+    not yet met the tracker rule (seeded < HNR_MIN_SEED_DAYS, default 5 = BHD's 120 h, AND ratio < 1), or whose name is listed in hnr_extra.txt
     (one substring per line; use it for torrents a tracker shows as "unsatisfied").
   * Maps each to the Radarr movie / Sonarr episode that owns the file and sets it unmonitored.
   * Records what it held in logs/hnr_guard_state.json so it can re-monitor when the window has passed
@@ -32,7 +32,7 @@ QBIT_URL = os.environ.get("QBIT_URL", "http://localhost:8080")
 QBIT_USER = os.environ.get("QBIT_USER", "admin")
 QBIT_PASS = os.environ.get("QBIT_PASS", "")
 
-HNR_DAYS = float(os.environ.get("HNR_MIN_SEED_DAYS", "30"))
+HNR_DAYS = float(os.environ.get("HNR_MIN_SEED_DAYS", "5"))  # BHD: 120 h seeding OR ratio 1.0
 STATE = "/logs/hnr_guard_state.json"
 EXTRA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hnr_extra.txt")
 
@@ -83,9 +83,12 @@ def main():
     for t in torrents:
         if t["save_path"].startswith("/arr"):
             continue  # library name is only a hardlink of the arr/ seed: safe to delete
-        age = (now - t["added_on"]) / 86400
+        # seeding_time is reset by fastresume edits, so use time since completion
+        done = t.get("completion_on", 0)
+        age = (now - (done if done > 0 else t["added_on"])) / 86400
         listed = any(x in t["name"].lower() for x in extra)
-        if age < HNR_DAYS or listed:
+        satisfied = t.get("ratio", 0) >= 1.0 or age >= HNR_DAYS
+        if (not satisfied) or listed:
             files = q.get(f"{base}/api/v2/torrents/files", params={"hash": t["hash"]}, timeout=60).json()
             young[t["hash"]] = (t["name"], {os.path.basename(f["name"]) for f in files}, age, listed)
     held_names = set().union(*[v[1] for v in young.values()]) if young else set()
@@ -98,8 +101,11 @@ def main():
         mf = m.get("movieFile")
         if mf and os.path.basename(mf["relativePath"]) in held_names and m["monitored"]:
             plan.append(("radarr", m["id"], m["title"], "hold"))
+    by_id = {str(m["id"]): m for m in radarr}
     for mid, info in list(state["radarr"].items()):
-        if not any(h in young for h in info["hashes"]):
+        m = by_id.get(mid)
+        mf = m.get("movieFile") if m else None
+        if not mf or os.path.basename(mf["relativePath"]) not in held_names:
             plan.append(("radarr", int(mid), info["title"], "release"))
     # Sonarr
     for s in arr_get("sonarr", "series"):
@@ -111,7 +117,11 @@ def main():
                     if ep["monitored"]:
                         plan.append(("sonarr", ep["id"], f"{s['title']} S{ep['seasonNumber']:02d}E{ep['episodeNumber']:02d}", "hold"))
     for eid, info in list(state["sonarr"].items()):
-        if not any(h in young for h in info["hashes"]):
+        ep = arr_get("sonarr", f"episode/{eid}")
+        names = set()
+        if ep.get("episodeFileId"):
+            names.add(os.path.basename(arr_get("sonarr", f"episodefile/{ep['episodeFileId']}")["relativePath"]))
+        if not names & held_names:
             plan.append(("sonarr", int(eid), info["title"], "release"))
 
     for app, ident, title, act in plan:
