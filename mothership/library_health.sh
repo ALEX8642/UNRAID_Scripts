@@ -2,7 +2,7 @@
 # library_health.sh - read-only health check for the Plex/Radarr/Sonarr/qBittorrent stack. Run ON the Unraid host (bash, curl, jq).
 # Checks: files Radarr/Sonarr track but are missing on disk; torrents in missingFiles/error; blocked or stuck import queue items;
 #         video files in Movies that Radarr does not know; array disks nearly full.
-# Notifies through Unraid's notification system (and a Discord webhook if DISCORD_WEBHOOK is set in the environment) only when something is wrong,
+# Notifies through Unraid's notification system (importance 'alert', which your Unraid setup sends by browser AND email; plus a Discord webhook if DISCORD_WEBHOOK is set) only when something is wrong,
 # plus a short "all clear" on Sundays. Usage:  library_health.sh [--quiet] [--no-notify]
 # Needs credentials from /mnt/user/system/scripts/mothership/.env (QBIT_URL/USER/PASS); the arr API keys are read from each app's config.xml.
 set -u
@@ -44,10 +44,10 @@ say "Movie files Radarr does not track (large videos): $unt"; [ $unt -gt 60 ] &&
 full=$(df -h /mnt/disk[0-9]* /mnt/cache 2>/dev/null | awk 'NR>1 && $5+0>=97 {print $6" "$5}' | tr '\n' ';')
 say "Disks at 97%+: ${full:-none}"; [ -n "$full" ] && ISSUES+=("Disks nearly full: $full")
 
-if [ ${#ISSUES[@]} -eq 0 ]; then MSG="All clear: no missing files, no stuck imports, qBittorrent healthy."; LEVEL=normal; else MSG=$(printf '%s\n' "${ISSUES[@]}"); LEVEL=warning; fi
+if [ ${#ISSUES[@]} -eq 0 ]; then MSG="All clear: no missing files, no stuck imports, qBittorrent healthy."; LEVEL=normal; else MSG=$(printf '%s\n' "${ISSUES[@]}"); LEVEL=alert; fi
 say ""; say "$MSG"
-if [ $NOTIFY = 1 ] && { [ $LEVEL = warning ] || [ "$(date +%u)" = 7 ]; }; then
-  /usr/local/emhttp/webGui/scripts/notify -e "Library health" -s "Library health: $([ $LEVEL = warning ] && echo "${#ISSUES[@]} issue(s)" || echo "all clear")" -d "$MSG" -i $LEVEL >/dev/null 2>&1
+if [ $NOTIFY = 1 ] && { [ $LEVEL = alert ] || [ "$(date +%u)" = 7 ]; }; then
+  /usr/local/emhttp/webGui/scripts/notify -e "Library health" -s "Library health: $([ $LEVEL = alert ] && echo "${#ISSUES[@]} issue(s)" || echo "all clear")" -d "$MSG" -i $LEVEL >/dev/null 2>&1
   [ -n "${DISCORD_WEBHOOK:-}" ] && curl -s -H "Content-Type: application/json" -d "$(jq -n --arg c "Library health:\n$MSG" '{content:$c}')" "$DISCORD_WEBHOOK" >/dev/null
 fi
-exit $([ $LEVEL = warning ] && echo 1 || echo 0)
+exit $([ $LEVEL = alert ] && echo 1 || echo 0)
