@@ -20,3 +20,10 @@ Kometa poster helpers are documented in `../kometa/README.md`.
 ## Scheduling gotcha (User Scripts plugin)
 
 The plugin reads `/tmp/user.scripts/schedule.json`, a copy made at boot from `/boot/config/plugins/user.scripts/schedule.json`. Editing the `/boot` file by hand does **not** reach cron until the copy is refreshed (`cp` the boot file over the tmp one, or save the schedule once in the plugin UI). Scripts added by hand and scheduled this way silently never run. After scheduling, confirm with `ls /tmp/user.scripts/finished` the next morning.
+
+
+## Dashboard integration (2026-10-21)
+`job_runner.py` executes jobs the Plex Dashboard queues in its `jobs/` folder (file removal for a title, Kometa poster reset). It re-classifies every file with `safe_ops` against the current state, refuses an `apply` whose plan digest no longer matches, expires jobs after 30 minutes and fails closed when qBittorrent is unreachable. `dashboard_jobs.sh` (every minute) runs it only when something is pending; `dashboard_notify.sh` (every 5 minutes) passes queued alerts to Unraid's `notify`. Both are registered as User Scripts with custom schedules.
+
+## Tests
+`python3 -m unittest discover -s mothership/tests` (also run by CI). The delete paths are covered: `safe_ops` (classification, hardlinks, FUSE refusal, traversal, pruning), `seed_cleanup` (two-strike, circuit breaker, upgrade evidence), `hnr_guard` (hold/release, empty-list guard), `orphan_scan` (three-source agreement, sanity guards), `dupe_review` (plan re-validation, fail-closed), `job_runner`, and `cross-disk-dedupe.sh` against a scratch tree.
