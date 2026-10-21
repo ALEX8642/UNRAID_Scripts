@@ -82,6 +82,17 @@ def torrent_main_names(q, t):
     return {os.path.basename(f["name"]) for f in big}
 
 
+def content_present(q, t):
+    """True if any of the torrent's own files still exists on the array. A bare directory check is not enough: after an
+    upgrade the library folder can still exist (holding the NEW files) while this torrent's files are gone."""
+    files = q.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": t["hash"]}, timeout=60).json()
+    sp = t.get("save_path", "").rstrip("/")
+    if not files:
+        return exists_on_array(t["content_path"])
+    big = [f for f in sorted(files, key=lambda f: -f["size"])[:3] if f["size"] > 50 * 1024 * 1024] or files[:1]  # the video(s); leftover .nfo/.jpg do not count as content
+    return any(exists_on_array(f"{sp}/{f['name']}") for f in big)
+
+
 def seed_rule_met(t, now):
     done = t.get("completion_on", 0) or t["added_on"]
     return t.get("ratio", 0) >= 1.0 or (now - done) / 86400 >= HNR_DAYS
@@ -106,7 +117,7 @@ def main():
     cands, notes = [], []
     for t in missing:
         label = t["name"][:80]
-        if exists_on_array(t["content_path"]):
+        if content_present(q, t):
             notes.append(f"KEEP   {label}: content exists on the array (qBittorrent path problem, not a deletion)")
             continue
         if deleted is None:

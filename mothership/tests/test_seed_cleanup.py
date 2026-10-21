@@ -100,3 +100,14 @@ class SeedCleanup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContentPresent(unittest.TestCase):
+    def test_directory_exists_but_own_files_gone(self):
+        # the folder exists (new library files live in it) but none of THIS torrent's files do -> treated as absent
+        t = torrent("a", "Show.S01", content_path="/tv/Show.S01", save_path="/tv")
+        fs = FakeSession([t], {"a": [{"name": "Show.S01/old.mkv", "size": 5}]})
+        with mock.patch.object(sc, "exists_on_array", side_effect=lambda p: p == "/tv/Show.S01"):
+            self.assertFalse(sc.content_present(fs, t))
+        with mock.patch.object(sc, "exists_on_array", side_effect=lambda p: p == "/tv/Show.S01/old.mkv"):
+            self.assertTrue(sc.content_present(fs, t))
