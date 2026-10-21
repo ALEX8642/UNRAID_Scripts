@@ -40,6 +40,8 @@ def raw_copies(host_path: str, disk_glob: Optional[str] = None) -> list:
     if not host_path.startswith(USER_PREFIX):
         return []
     rel = host_path[len(USER_PREFIX):]
+    if ".." in rel.split("/") or not rel:
+        return []   # never resolve a path that climbs out of the share
     hits = [p for p in glob.glob(os.path.join(disk_glob, rel)) if os.path.lexists(p)]
     cache = os.path.join(os.path.dirname(disk_glob), "cache", rel)
     if os.path.lexists(cache):
@@ -166,11 +168,12 @@ def prune_empty_parents(removed_paths: list, stop_at=("Movies", "tv"), apply: bo
     """After removing files, rmdir (never rm -r) the now-empty parent folders of exactly those files, walking up but
     stopping at a library root (.../Media/Movies or .../Media/tv) and at the first non-empty folder. Folders that
     were already empty before (e.g. Radarr's placeholder folders for movies still waiting on a download) are never
-    touched, because only parents of just-removed files are considered."""
+    touched, because only parents of just-removed files are considered. Only folders INSIDE the Movies or tv trees
+    are ever candidates: Media itself, arr/ (qBittorrent's save path) and anything else are left alone."""
     pruned = []
     for p in removed_paths:
         d = os.path.dirname(p)
-        while d and os.path.basename(d) not in stop_at and "/Media/" in d + "/":
+        while d and os.path.basename(d) not in stop_at and ("/Media/Movies/" in d + "/" or "/Media/tv/" in d + "/"):
             try:
                 if os.listdir(d):
                     break
@@ -207,10 +210,14 @@ def execute(decision: Decision, session, base_url: str, apply: bool, logfile: st
     if decision.mode == "REFUSE":
         return [f"refused: {decision.reason}"]
     res = [f"{o}: {p}" for p, o in unlink_raw(decision.unlink_raw, apply, logfile, why or decision.mode)]
-    if decision.tag:
-        res.append("qBit " + qbit_tag(session, base_url, decision.torrent_hash, apply, logfile))
-    if decision.delete_torrent:
-        res.append("qBit " + qbit_delete(session, base_url, decision.torrent_hash, apply, logfile))
+    for label, fn, wanted in (("tag", qbit_tag, decision.tag), ("delete", qbit_delete, decision.delete_torrent)):
+        if not wanted:
+            continue
+        try:
+            res.append("qBit " + fn(session, base_url, decision.torrent_hash, apply, logfile))
+        except Exception as e:  # noqa: BLE001 - the library name may already be unlinked; report, do not crash the run
+            _log(logfile, f"QBIT-{label.upper()} {decision.torrent_hash} FAILED: {e}")
+            res.append(f"qBit {label} FAILED ({type(e).__name__}); library names were already handled - check the torrent by hand")
     return res
 
 

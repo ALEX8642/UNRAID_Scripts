@@ -49,6 +49,10 @@ LOGFILE = "/logs/orphan-scan.log"
 QBIT_URL = os.environ.get("QBIT_URL", "http://localhost:8080")
 QBIT_USER = os.environ.get("QBIT_USER", "admin")
 QBIT_PASS = os.environ.get("QBIT_PASS", "")
+RADARR_URL = os.environ.get("RADARR_URL", "http://localhost:7878")
+RADARR_KEY = os.environ.get("RADARR_KEY", "")
+SONARR_URL = os.environ.get("SONARR_URL", "http://localhost:8989")
+SONARR_KEY = os.environ.get("SONARR_KEY", "")
 # ==== END CONFIG ====
 
 console = Console()
@@ -131,6 +135,53 @@ def load_qbit_known() -> set:
     return known
 
 
+def load_arr_known() -> set:
+    """Every file Radarr or Sonarr tracks. A tracked library file is never an orphan, even if Plex has not indexed it
+    and no torrent claims it (Plex excluded/unscanned, or a loose import)."""
+    known = set()
+    for url, key, kind in ((RADARR_URL, RADARR_KEY, "radarr"), (SONARR_URL, SONARR_KEY, "sonarr")):
+        if not key:
+            console.print(f"[bold red]FATAL:[/bold red] {kind.upper()}_KEY not set. Refusing to run: tracked files must be excluded from the orphan list.")
+            sys.exit(1)
+        h = {"X-Api-Key": key}
+        if kind == "radarr":
+            r = requests.get(f"{url}/api/v3/movie", headers=h, timeout=120)
+            r.raise_for_status()
+            paths = [m["movieFile"]["path"] for m in r.json() if m.get("movieFile")]
+        else:
+            r = requests.get(f"{url}/api/v3/series", headers=h, timeout=120)
+            r.raise_for_status()
+            paths = []
+            for s_ in r.json():
+                rr = requests.get(f"{url}/api/v3/episodefile", params={"seriesId": s_["id"]}, headers=h, timeout=120)
+                rr.raise_for_status()
+                paths += [f["path"] for f in rr.json()]
+        for p in paths:
+            hp, mapped = to_host_path(p)
+            if mapped:
+                known.add(hp)
+    return known
+
+
+def find_orphans(on_disk: dict, plex_known: set, qbit_known: set, arr_known: set) -> dict:
+    """Files claimed by none of Plex, qBittorrent, Radarr or Sonarr."""
+    return {p: v for p, v in on_disk.items() if p not in plex_known and p not in qbit_known and p not in arr_known}
+
+
+def sanity_problem(on_disk: dict, plex_known: set, qbit_known: set, arr_known: set):
+    """A reason the indexes cannot be trusted (so --apply must refuse), or None. A wrong Plex DB path, an unmapped
+    mount or an app returning nothing would otherwise make every file look orphaned."""
+    if not on_disk:
+        return "no video files found on disk (library roots unreadable?)"
+    if not qbit_known:
+        return "qBittorrent index is empty"
+    if not arr_known:
+        return "Radarr/Sonarr index is empty"
+    if len(plex_known) < 0.5 * len(on_disk):
+        return f"Plex index looks wrong: {len(plex_known)} known paths for {len(on_disk)} files on disk (path mapping or DB location?)"
+    return None
+
+
 def fmt_size(n: int) -> str:
     return f"{n / (1024**3):.2f} GB"
 
@@ -165,8 +216,14 @@ def main():
         t3 = progress.add_task("Scanning disk for video files...", total=None)
         on_disk = scan_disk(progress, t3)
 
+    arr_known = load_arr_known()
+    problem = sanity_problem(on_disk, plex_known, qbit_known, arr_known)
+    if problem:
+        console.print(f"[bold red]Refusing to continue:[/bold red] {problem}. Nothing was listed or deleted.")
+        log(f"REFUSED: {problem}")
+        return 1
     not_in_plex = {p: v for p, v in on_disk.items() if p not in plex_known}
-    orphans = {p: v for p, v in not_in_plex.items() if p not in qbit_known}
+    orphans = find_orphans(on_disk, plex_known, qbit_known, arr_known)
 
     console.print(f"\nOn disk: [bold]{len(on_disk)}[/bold]  Plex-known: [bold]{len(plex_known)}[/bold]  qBittorrent-known: [bold]{len(qbit_known)}[/bold]")
     # The raw counts above don't subtract cleanly into a meaningful number — Plex's own
@@ -178,7 +235,7 @@ def main():
     if not_in_plex:
         console.print(
             f"{len(not_in_plex)} file(s) on disk aren't in Plex yet — "
-            f"{len(not_in_plex) - len(orphans)} of those are still claimed by qBittorrent "
+            f"{len(not_in_plex) - len(orphans)} of those are still claimed by qBittorrent or tracked by Radarr/Sonarr "
             f"(not orphans), {len(orphans)} genuinely unclaimed by either.\n"
         )
     else:

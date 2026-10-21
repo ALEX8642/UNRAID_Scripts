@@ -33,7 +33,7 @@ QBIT_USER = os.environ.get("QBIT_USER", "admin")
 QBIT_PASS = os.environ.get("QBIT_PASS", "")
 
 HNR_DAYS = float(os.environ.get("HNR_MIN_SEED_DAYS", "5"))  # BHD: 120 h seeding OR ratio 1.0
-STATE = "/logs/hnr_guard_state.json"
+STATE = os.environ.get("HNR_STATE", "/logs/hnr_guard_state.json")
 EXTRA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hnr_extra.txt")
 
 
@@ -75,6 +75,10 @@ def main():
     q = qbit_session()
     base = QBIT_URL
     torrents = q.get(f"{base}/api/v2/torrents/info", timeout=60).json()
+    if not torrents:
+        # qBittorrent restarting or an API hiccup: with no torrents everything held would look "released" and get
+        # re-monitored, letting Radarr/Sonarr upgrade (delete) young seeds. Never act on an empty answer.
+        sys.exit("qBittorrent returned no torrents; refusing to hold or release anything")
     extra = []
     if os.path.exists(EXTRA):
         extra = [l.strip().lower() for l in open(EXTRA) if l.strip() and not l.startswith("#")]
@@ -133,12 +137,19 @@ def main():
         return
     for app, ident, title, act in plan:
         want = (act == "release")
-        if app == "radarr":
-            m = arr_get("radarr", f"movie/{ident}")
-            m["monitored"] = want
-            arr_put("radarr", f"movie/{ident}", m)
-        else:
-            arr_put("sonarr", "episode/monitor", {"episodeIds": [ident], "monitored": want})
+        try:
+            if app == "radarr":
+                m = arr_get("radarr", f"movie/{ident}")
+                m["monitored"] = want
+                arr_put("radarr", f"movie/{ident}", m)
+            else:
+                arr_put("sonarr", "episode/monitor", {"episodeIds": [ident], "monitored": want})
+        except requests.RequestException as e:
+            # One bad item (e.g. a movie deleted from Radarr) must not stop the rest, and its state stays as it was.
+            print(f"FAILED {act} {app} {ident} {title}: {e}")
+            if act == "release" and getattr(getattr(e, "response", None), "status_code", None) == 404:
+                state[app].pop(str(ident), None)   # the item no longer exists: nothing left to release
+            continue
         key = str(ident)
         if act == "hold":
             state[app][key] = {"title": title, "hashes": list(young.keys())}

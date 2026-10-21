@@ -133,5 +133,54 @@ class ExecuteTests(unittest.TestCase):
         out = so.unlink_raw(["/mnt/user/Media/Movies/x.mkv"], apply=True); self.assertEqual(out[0][1], "refused: FUSE path")
 
 
+class HardeningTests(unittest.TestCase):
+    def test_raw_copies_refuses_path_traversal(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/disk1/Media"); os.makedirs(f"{d}/etc"); open(f"{d}/etc/passwd", "w").close()
+            self.assertEqual(raw_copies("/mnt/user/../etc/passwd", disk_glob=f"{d}/disk[0-9]*"), [])
+            self.assertEqual(raw_copies("/mnt/user/", disk_glob=f"{d}/disk[0-9]*"), [])
+
+    def test_prune_never_removes_media_arr_or_library_roots(self):
+        with tempfile.TemporaryDirectory() as d:
+            # a seed folder under arr/ that empties out must NOT be pruned (qBittorrent's save path lives there)
+            os.makedirs(f"{d}/disk1/Media/arr/movies/Seed"); f = f"{d}/disk1/Media/arr/movies/Seed/x.mkv"
+            open(f, "w").close(); os.remove(f)
+            self.assertEqual(so.prune_empty_parents([f]), [])
+            self.assertTrue(os.path.isdir(f"{d}/disk1/Media/arr/movies/Seed"))
+            # an emptied library tree stops at the library root, never removing Media itself
+            os.makedirs(f"{d}/disk1/Media/Movies/Only (2020)"); g = f"{d}/disk1/Media/Movies/Only (2020)/o.mkv"
+            open(g, "w").close(); os.remove(g)
+            self.assertEqual(so.prune_empty_parents([g]), [f"{d}/disk1/Media/Movies/Only (2020)"])
+            self.assertTrue(os.path.isdir(f"{d}/disk1/Media/Movies")); self.assertTrue(os.path.isdir(f"{d}/disk1/Media"))
+
+    def test_qbit_failure_after_unlink_is_reported_not_raised(self):
+        d = tempfile.mkdtemp(); f = os.path.join(d, "a.mkv"); open(f, "w").close()
+        class Boom:
+            def post(self, *a, **k): raise ConnectionError("qbit down")
+        dec = classify_removal([f], TorrentInfo("h", "n", 100, covers_exact_path=False))
+        out = execute(dec, Boom(), "http://q", apply=True)
+        self.assertFalse(os.path.exists(f))                      # library name was handled first
+        self.assertTrue(any("FAILED" in o for o in out))
+
+    def test_unlink_refuses_directories_and_missing(self):
+        d = tempfile.mkdtemp(); sub = os.path.join(d, "dir"); os.makedirs(sub)
+        out = dict(so.unlink_raw([sub, os.path.join(d, "nope.mkv")], apply=True))
+        self.assertEqual(out[sub], "missing"); self.assertTrue(os.path.isdir(sub))
+
+    def test_unlink_only_removes_the_name_not_other_hardlinks(self):
+        d = tempfile.mkdtemp(); a = os.path.join(d, "a.mkv"); b = os.path.join(d, "b.mkv")
+        
+        with open(a, "w") as fh: fh.write("data")
+        os.link(a, b)
+        so.unlink_raw([a], apply=True)
+        self.assertFalse(os.path.exists(a)); self.assertEqual(open(b).read(), "data")
+
+    def test_dry_run_prune_and_unlink_touch_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/disk1/Media/Movies/Gone"); f = f"{d}/disk1/Media/Movies/Gone/g.mkv"; open(f, "w").close(); os.remove(f)
+            self.assertEqual(so.prune_empty_parents([f], apply=False), [f"{d}/disk1/Media/Movies/Gone"])
+            self.assertTrue(os.path.isdir(f"{d}/disk1/Media/Movies/Gone"))
+
+
 if __name__ == "__main__":
     unittest.main()
