@@ -6,8 +6,10 @@
 # plus a short "all clear" on Sundays. Usage:  library_health.sh [--quiet] [--no-notify]
 # Needs credentials from /mnt/user/system/scripts/mothership/.env (QBIT_URL/USER/PASS); the arr API keys are read from each app's config.xml.
 set -u
+exec 9>/tmp/library_health.lock; flock -n 9 || exit 0
 QUIET=0; NOTIFY=1; for a in "$@"; do case $a in --quiet) QUIET=1;; --no-notify) NOTIFY=0;; esac; done
-set -a; . /mnt/user/system/scripts/mothership/.env 2>/dev/null; set +a
+set -a; . /mnt/user/system/scripts/mothership/.env 2>/dev/null || echo "warning: .env not readable"; set +a
+QBIT_USER=${QBIT_USER:-}; QBIT_PASS=${QBIT_PASS:-}; QBIT_URL=${QBIT_URL:-}
 ISSUES=(); say(){ [ $QUIET = 1 ] || echo "$@"; }
 arr(){ # arr APP path  -> JSON
   local app=$1 path=$2 key port ip
@@ -21,17 +23,18 @@ for a in radarr sonarr; do arr $a system/status | jq -e .version >/dev/null 2>&1
 # 1. Radarr files missing on disk
 miss=0; list=""
 while IFS= read -r f; do r="Media/${f#/media/}"; exists "$r" || { miss=$((miss+1)); [ $miss -le 5 ] && list="$list\n   $f"; }; done < <(arr radarr movie | jq -r '.[]|select(.hasFile)|.movieFile.path')
-say "Radarr tracked files missing on disk: $miss"; [ $miss -gt 0 ] && ISSUES+=("Radarr: $miss tracked file(s) missing on disk$(printf "$list")")
+say "Radarr tracked files missing on disk: $miss"; [ $miss -gt 0 ] && ISSUES+=("Radarr: $miss tracked file(s) missing on disk$(printf "%b" "$list")")
 # 2. Sonarr files missing on disk
 missT=0; listT=""
 : > /tmp/health_tracked_tv.txt
 for id in $(arr sonarr series | jq -r '.[]|select(.statistics.episodeFileCount>0)|.id'); do
   while IFS= read -r f; do r="Media/${f#/media/}"; echo "$r" >> /tmp/health_tracked_tv.txt; exists "$r" || { missT=$((missT+1)); [ $missT -le 5 ] && listT="$listT\n   $f"; }; done < <(arr sonarr "episodefile?seriesId=$id" | jq -r '.[].path')
 done
-say "Sonarr tracked files missing on disk: $missT"; [ $missT -gt 0 ] && ISSUES+=("Sonarr: $missT tracked episode file(s) missing on disk$(printf "$listT")")
+say "Sonarr tracked files missing on disk: $missT"; [ $missT -gt 0 ] && ISSUES+=("Sonarr: $missT tracked episode file(s) missing on disk$(printf "%b" "$listT")")
 # 3. qBittorrent torrents in trouble
 CK=$(mktemp); curl -s -c $CK -d "username=$QBIT_USER&password=$QBIT_PASS" "$QBIT_URL/api/v2/auth/login" >/dev/null
-bad=$(curl -s -b $CK "$QBIT_URL/api/v2/torrents/info" | jq -r '[.[]|select(.state=="missingFiles" or .state=="error")]|length'); rm -f $CK
+bad=$(curl -s -b $CK "$QBIT_URL/api/v2/torrents/info" | jq -r 'if type=="array" and length>0 then [.[]|select(.state=="missingFiles" or .state=="error")]|length else "unreadable" end' 2>/dev/null); rm -f $CK
+if [ "$bad" = "unreadable" ] || [ -z "$bad" ]; then ISSUES+=("qBittorrent unreachable or returned no torrents: its health cannot be judged"); bad=0; fi
 say "qBittorrent torrents missing files / in error: $bad"; [ "${bad:-0}" -gt 0 ] && ISSUES+=("qBittorrent: $bad torrent(s) in missingFiles/error state")
 # 4. import queue stuck or blocked
 for app in radarr sonarr; do
@@ -42,12 +45,12 @@ done
 arr radarr movie | jq -r '.[]|select(.hasFile)|(.path|sub("^/media/";"Media/"))+"/"+.movieFile.relativePath' | sort -u > /tmp/health_tracked.txt
 unt=0; ul=""
 while IFS= read -r p; do r=${p#/mnt/disk*/}; grep -qxF -- "$r" /tmp/health_tracked.txt || { unt=$((unt+1)); [ $unt -le 5 ] && ul="$ul\n   $(basename "$p")"; }; done < <(for d in /mnt/disk*/Media/Movies; do find "$d" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m2ts' -o -iname '*.avi' \) -size +300M; done)
-say "Movie files Radarr does not track (large videos): $unt"; [ $unt -gt 60 ] && ISSUES+=("Movies: $unt large untracked video files (was ~45 after the Oct 2026 cleanup, mostly intentional editions)$(printf "$ul")")
+say "Movie files Radarr does not track (large videos): $unt"; [ $unt -gt 60 ] && ISSUES+=("Movies: $unt large untracked video files (was ~45 after the Oct 2026 cleanup, mostly intentional editions)$(printf "%b" "$ul")")
 # 5b. untracked video files in tv/ (Sonarr has no record of them; they would be lost if someone deleted them thinking they were copies)
 sort -u -o /tmp/health_tracked_tv.txt /tmp/health_tracked_tv.txt
 untT=0; ulT=""
 while IFS= read -r p; do r=${p#/mnt/disk*/}; grep -qxF -- "$r" /tmp/health_tracked_tv.txt || { untT=$((untT+1)); [ $untT -le 5 ] && ulT="$ulT\n   $(basename "$p")"; }; done < <(for d in /mnt/disk*/Media/tv; do find "$d" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.m4v' \) -size +50M -links 1 -mtime +1; done)
-say "TV video files Sonarr does not track (single-link): $untT"; [ $untT -gt 20 ] && ISSUES+=("TV: $untT untracked single-copy video files (was 14 after the Oct 2026 adoption)$(printf "$ulT")")
+say "TV video files Sonarr does not track (single-link): $untT"; [ $untT -gt 20 ] && ISSUES+=("TV: $untT untracked single-copy video files (was 14 after the Oct 2026 adoption)$(printf "%b" "$ulT")")
 # 6. disks nearly full
 full=$(df -h /mnt/disk[0-9]* /mnt/cache 2>/dev/null | awk 'NR>1 && $5+0>=97 {print $6" "$5}' | tr '\n' ';')
 say "Disks at 97%+: ${full:-none}"; [ -n "$full" ] && ISSUES+=("Disks nearly full: $full")

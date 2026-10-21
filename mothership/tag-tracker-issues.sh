@@ -52,6 +52,8 @@ for arg in "$@"; do
   esac
 done
 
+exec 9>/tmp/tag-tracker-issues.lock
+flock -n 9 || { echo "another tag-tracker-issues run is in progress"; exit 0; }
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR" "$(dirname "$LOGFILE")"
 

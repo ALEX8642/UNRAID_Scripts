@@ -67,6 +67,9 @@ for arg in "$@"; do
   esac
 done
 
+# one instance at a time: a second run would delete the first one's work lists out from under it
+exec 9>"${LOCKFILE:-/tmp/cross-disk-dedupe.lock}"
+flock -n 9 || { echo "another cross-disk-dedupe run is in progress"; exit 0; }
 rm -rf "$WORKDIR"
 mkdir -p "$WORKDIR" "$(dirname "$LOGFILE")"
 
