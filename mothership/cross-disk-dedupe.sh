@@ -49,8 +49,9 @@ EXCLUDE_RELPATHS=(
   "Media/tv/The Bridge (2011)/The.Bridge.2011.S01E01.1080i.BluRay.REMUX.AVC.DTS-HD.MA.5.1-EPSiLON.mkv"
 )
 
-WORKDIR="/tmp/cross-disk-dedupe"
-LOGFILE="/logs/cross-disk-dedupe.log"
+MNT="${MNT:-/mnt}"                       # overridable so the tests can run against a scratch tree
+WORKDIR="${WORKDIR:-/tmp/cross-disk-dedupe}"
+LOGFILE="${LOGFILE:-/logs/cross-disk-dedupe.log}"
 # ==== END CONFIG ====
 
 DRY_RUN=1
@@ -94,7 +95,7 @@ is_excluded() {
 }
 
 # ---- discover physical disks ----
-mapfile -t DISKS < <(find /mnt -maxdepth 1 -type d -name 'disk*' -printf '%f\n' | sort -V)
+mapfile -t DISKS < <(find "$MNT" -maxdepth 1 -type d -name 'disk*' -printf '%f\n' | sort -V)
 if [ "${#DISKS[@]}" -eq 0 ]; then
   log "FATAL: no /mnt/diskN mounts found. Refusing to run."
   exit 1
@@ -120,10 +121,10 @@ build_qbit_index() {
   fi
   curl -s -b "$cookie" "$QBIT_URL/api/v2/torrents/info" \
     | jq -r '.[] | .content_path' \
-    | sed -e 's|^/movies/|/mnt/user/Media/Movies/|' \
-          -e 's|^/tv/|/mnt/user/Media/tv/|' \
-          -e 's|^/arr/movies/|/mnt/user/Media/arr/movies/|' \
-          -e 's|^/arr/shows/|/mnt/user/Media/arr/shows/|' \
+    | sed -e "s|^/movies/|$MNT/user/Media/Movies/|" \
+          -e "s|^/tv/|$MNT/user/Media/tv/|" \
+          -e "s|^/arr/movies/|$MNT/user/Media/arr/movies/|" \
+          -e "s|^/arr/shows/|$MNT/user/Media/arr/shows/|" \
     > "$WORKDIR/qbit_paths.txt"
   rm -f "$cookie"
 }
@@ -132,7 +133,7 @@ build_qbit_index() {
 : > "$WORKDIR/all_files.txt"
 for disk in "${DISKS[@]}"; do
   for sub in "${SCAN_SUBDIRS[@]}"; do
-    root="/mnt/$disk/$sub"
+    root="$MNT/$disk/$sub"
     [ -d "$root" ] || continue
     for ext in "${VIDEO_EXTENSIONS[@]}" "${SIDECAR_EXTENSIONS[@]}"; do
       find "$root" -type f -iname "*.$ext" -printf "%s\t$disk\t$sub/%P\n" 2>/dev/null
@@ -183,9 +184,9 @@ while IFS=$'\t' read -r count diskcsv sizecsv relpath; do
   fi
 
   disk_a="${disks_arr[0]}"; disk_b="${disks_arr[1]}"
-  path_a="/mnt/$disk_a/$relpath"
-  path_b="/mnt/$disk_b/$relpath"
-  muser_path="/mnt/user/$relpath"
+  path_a="$MNT/$disk_a/$relpath"
+  path_b="$MNT/$disk_b/$relpath"
+  muser_path="$MNT/user/$relpath"
 
   if [ ! -f "$muser_path" ]; then
     log "SKIP (no /mnt/user path resolves here — unexpected, needs manual review): $relpath"
