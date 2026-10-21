@@ -22,8 +22,9 @@ while IFS= read -r f; do r="Media/${f#/media/}"; exists "$r" || { miss=$((miss+1
 say "Radarr tracked files missing on disk: $miss"; [ $miss -gt 0 ] && ISSUES+=("Radarr: $miss tracked file(s) missing on disk$(printf "$list")")
 # 2. Sonarr files missing on disk
 missT=0; listT=""
+: > /tmp/health_tracked_tv.txt
 for id in $(arr sonarr series | jq -r '.[]|select(.statistics.episodeFileCount>0)|.id'); do
-  while IFS= read -r f; do r="Media/${f#/media/}"; exists "$r" || { missT=$((missT+1)); [ $missT -le 5 ] && listT="$listT\n   $f"; }; done < <(arr sonarr "episodefile?seriesId=$id" | jq -r '.[].path')
+  while IFS= read -r f; do r="Media/${f#/media/}"; echo "$r" >> /tmp/health_tracked_tv.txt; exists "$r" || { missT=$((missT+1)); [ $missT -le 5 ] && listT="$listT\n   $f"; }; done < <(arr sonarr "episodefile?seriesId=$id" | jq -r '.[].path')
 done
 say "Sonarr tracked files missing on disk: $missT"; [ $missT -gt 0 ] && ISSUES+=("Sonarr: $missT tracked episode file(s) missing on disk$(printf "$listT")")
 # 3. qBittorrent torrents in trouble
@@ -40,6 +41,11 @@ arr radarr movie | jq -r '.[]|select(.hasFile)|(.path|sub("^/media/";"Media/"))+
 unt=0; ul=""
 while IFS= read -r p; do r=${p#/mnt/disk*/}; grep -qxF -- "$r" /tmp/health_tracked.txt || { unt=$((unt+1)); [ $unt -le 5 ] && ul="$ul\n   $(basename "$p")"; }; done < <(for d in /mnt/disk*/Media/Movies; do find "$d" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m2ts' -o -iname '*.avi' \) -size +300M; done)
 say "Movie files Radarr does not track (large videos): $unt"; [ $unt -gt 60 ] && ISSUES+=("Movies: $unt large untracked video files (was ~45 after the Oct 2026 cleanup, mostly intentional editions)$(printf "$ul")")
+# 5b. untracked video files in tv/ (Sonarr has no record of them; they would be lost if someone deleted them thinking they were copies)
+sort -u -o /tmp/health_tracked_tv.txt /tmp/health_tracked_tv.txt
+untT=0; ulT=""
+while IFS= read -r p; do r=${p#/mnt/disk*/}; grep -qxF -- "$r" /tmp/health_tracked_tv.txt || { untT=$((untT+1)); [ $untT -le 5 ] && ulT="$ulT\n   $(basename "$p")"; }; done < <(for d in /mnt/disk*/Media/tv; do find "$d" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.avi' -o -iname '*.m4v' \) -size +50M -links 1 -mtime +1; done)
+say "TV video files Sonarr does not track (single-link): $untT"; [ $untT -gt 20 ] && ISSUES+=("TV: $untT untracked single-copy video files (was 14 after the Oct 2026 adoption)$(printf "$ulT")")
 # 6. disks nearly full
 full=$(df -h /mnt/disk[0-9]* /mnt/cache 2>/dev/null | awk 'NR>1 && $5+0>=97 {print $6" "$5}' | tr '\n' ';')
 say "Disks at 97%+: ${full:-none}"; [ -n "$full" ] && ISSUES+=("Disks nearly full: $full")
