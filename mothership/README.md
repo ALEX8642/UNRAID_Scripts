@@ -16,3 +16,7 @@ Everything here is **dry-run by default** and never writes through `/mnt/user` (
 | `safe_ops.py` | Shared safety layer used by the tools above (raw-disk unlinks, seeds handled through qBittorrent) | library, not run directly; tests: `python3 -m unittest discover -s tests` |
 
 Kometa poster helpers are documented in `../kometa/README.md`.
+
+## Scheduling gotcha (User Scripts plugin)
+
+The plugin reads `/tmp/user.scripts/schedule.json`, a copy made at boot from `/boot/config/plugins/user.scripts/schedule.json`. Editing the `/boot` file by hand does **not** reach cron until the copy is refreshed (`cp` the boot file over the tmp one, or save the schedule once in the plugin UI). Scripts added by hand and scheduled this way silently never run. After scheduling, confirm with `ls /tmp/user.scripts/finished` the next morning.
