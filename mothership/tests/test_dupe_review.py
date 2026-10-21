@@ -56,7 +56,7 @@ class ExecutePlan(unittest.TestCase):
                 mock.patch.object(dr, "torrent_for", return_value=torrent), mock.patch.object(dr, "plex_refresh_and_empty_trash"), \
                 mock.patch.object(dr.safe_ops, "execute", side_effect=lambda dec, *a, **k: executed.append(dec.mode) or []), \
                 mock.patch.object(dr.safe_ops, "file_identity", return_value=(1, 1, 1)), mock.patch.object(dr.os.path, "exists", return_value=True), \
-                mock.patch.object(dr, "QBIT_SESSION", None):
+                mock.patch.object(dr, "QBIT_SESSION", object()):
             dr.execute_plan(path)
         return executed
 
@@ -77,6 +77,13 @@ class ExecutePlan(unittest.TestCase):
     def test_loser_on_two_disks_is_refused(self):
         raw = dict(self.RAW); raw["/mnt/user/Media/Movies/A/lose.mkv"] = ["/mnt/disk1/x", "/mnt/disk2/x"]
         self.assertEqual(self.run_plan(self.plan(), raw), [])
+
+    def test_apply_without_qbit_is_refused_not_silently_unsafe(self):
+        with mock.patch.object(dr, "APPLY", True), mock.patch.object(dr, "QBIT_SESSION", None):
+            with self.assertRaises(SystemExit):
+                dr.require_qbit_for_apply()
+        with mock.patch.object(dr, "APPLY", False), mock.patch.object(dr, "QBIT_SESSION", None):
+            dr.require_qbit_for_apply()   # dry runs may proceed
 
     def test_loser_equal_to_keeper_is_refused(self):
         raw = dict(self.RAW); raw["/mnt/user/Media/Movies/A/lose.mkv"] = raw["/mnt/user/Media/Movies/A/keep.mkv"]

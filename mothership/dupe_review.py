@@ -940,6 +940,14 @@ def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) 
     return "deleted" if removed else "tagged"
 
 
+def require_qbit_for_apply() -> None:
+    """Fail closed: without a qBittorrent session torrent_for() returns None for everything, which would classify seeded
+    files as free to unlink. Applying without the seeding check is never acceptable."""
+    if APPLY and QBIT_SESSION is None:
+        console.print("[bold red]Refusing to --apply: qBittorrent is unreachable, so seeded files cannot be recognised.[/bold red]")
+        sys.exit(2)
+
+
 def execute_plan(path: str) -> None:
     """Re-validate and run a plan written by a dry-run review. Every action is re-classified against the CURRENT
     state; anything that changed since planning is skipped, not guessed at. Dry-run unless --apply."""
@@ -947,6 +955,7 @@ def execute_plan(path: str) -> None:
     actions = json.load(open(path))
     console.print(Panel(f"Plan {path}: {len(actions)} action(s) - {'APPLY' if APPLY else 'DRY RUN (add --apply to execute)'}", style="magenta"))
     load_qbit_index()
+    require_qbit_for_apply()
     done = 0
     for a in actions:
         raw = raw_copies(a["loser"])
@@ -1084,6 +1093,7 @@ def main():
         sonarr_idx = load_sonarr_index(progress, progress.add_task("Indexing Sonarr episode files...", total=None))
         qbit_index = load_qbit_index()
         groups = build_groups(radarr_idx, sonarr_idx, qbit_index, progress, t1)
+    require_qbit_for_apply()
 
     console.print(f"\n[bold]{len(groups)}[/bold] titles have more than one version in your library.\n")
     if use_trash:
