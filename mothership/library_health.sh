@@ -16,6 +16,8 @@ arr(){ # arr APP path  -> JSON
   curl -s -m 120 -H "X-Api-Key: $key" "http://$ip:$port/api/v3/$path"; }
 exists(){ ls /mnt/disk*/"$1" >/dev/null 2>&1 || ls /mnt/cache/"$1" >/dev/null 2>&1; }
 
+# 0. the numbers below mean nothing if an API is down (an empty answer would read as "0 problems")
+for a in radarr sonarr; do arr $a system/status | jq -e .version >/dev/null 2>&1 || ISSUES+=("$a API unreachable: the checks below cannot be trusted"); done
 # 1. Radarr files missing on disk
 miss=0; list=""
 while IFS= read -r f; do r="Media/${f#/media/}"; exists "$r" || { miss=$((miss+1)); [ $miss -le 5 ] && list="$list\n   $f"; }; done < <(arr radarr movie | jq -r '.[]|select(.hasFile)|.movieFile.path')
