@@ -26,7 +26,17 @@ from typing import Optional
 TAG_DELETE_LATER = "delete-later"
 # Conservative stand-in for tracker hit-and-run rules (which are members-only and vary):
 # a torrent seeded for fewer days than this is treated as possibly still inside its window.
-HNR_MIN_SEED_DAYS = float(os.environ.get("HNR_MIN_SEED_DAYS", "30"))
+def _env_days(name, default, floor):
+    try:
+        v = float(os.environ.get(name, default))
+    except ValueError:
+        v = float(default)
+    return max(v, floor)   # a typo of 0 or a negative number must never turn every seed into "seasoned"
+
+
+HNR_MIN_SEED_DAYS = _env_days("HNR_MIN_SEED_DAYS", "30", 5.0)
+BHD_RULE_DAYS = 5.0   # BeyondHD: seed 120 h OR ratio 1.0
+SEEDING_STATES = ("uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP")
 # Torrents with more than this many files are treated as packs: never deleted per file.
 MAX_TORRENT_FILES = 3
 # Where the physical array disks live (overridable for tests).
@@ -42,7 +52,9 @@ def raw_copies(host_path: str, disk_glob: Optional[str] = None) -> list:
     rel = host_path[len(USER_PREFIX):]
     if ".." in rel.split("/") or not rel:
         return []   # never resolve a path that climbs out of the share
-    hits = [p for p in glob.glob(os.path.join(disk_glob, rel)) if os.path.lexists(p)]
+    # Only the disk part is a pattern. A name like "Foo [2020]/a.mkv" must not be read as a character class, and "Who?.mkv"
+    # must not match "Who!.mkv": that would unlink a different title's file.
+    hits = [p for p in glob.glob(os.path.join(disk_glob, glob.escape(rel))) if os.path.lexists(p) and p.endswith("/" + rel)]
     cache = os.path.join(os.path.dirname(disk_glob), "cache", rel)
     if os.path.lexists(cache):
         hits.append(cache)
@@ -66,8 +78,10 @@ def other_names(raw_path: str, subdirs=("Media/arr",)) -> list:
     for sub in subdirs:
         d = os.path.join(root, sub)
         if os.path.isdir(d):
-            out = subprocess.run(["find", d, "-xdev", "-type", "f", "-inum", str(st.st_ino)], capture_output=True, text=True).stdout
-            found += [l for l in out.splitlines() if l and l != raw_path]
+            r = subprocess.run(["find", d, "-xdev", "-type", "f", "-inum", str(st.st_ino)], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"hardlink search failed in {d}: {r.stderr.strip()[:120]}")
+            found += [l for l in r.stdout.splitlines() if l and l != raw_path]
     return found
 
 
@@ -80,6 +94,7 @@ class TorrentInfo:
     tracker: str = ""
     n_files: int = 1
     covers_exact_path: bool = True   # True when this torrent's own file IS the path being removed
+    shared_with: int = 0             # how many OTHER torrents point at the same data (cross-seeding); deleting files would break them
 
 
 @dataclass
@@ -106,6 +121,22 @@ MODES = {
 }
 
 
+def seed_rule_met(t: dict, now: float, days: float = BHD_RULE_DAYS) -> bool:
+    """BeyondHD: 120 h seeded OR ratio 1.0. `completion_on` is -1/0 for torrents that never completed, which must never read as
+    "ancient". Wall-clock age only counts for a torrent that is actually seeding right now (or long gone: 14+ days), because a
+    paused, stopped or stalled-on-missing-files torrent accrues no seeding time. qBittorrent's seeding_time is honoured too
+    (fastresume edits reset it, which only ever makes this stricter)."""
+    done = t.get("completion_on") or 0
+    if done <= 0:
+        return False
+    if (t.get("ratio") or 0) >= 1.0:
+        return True
+    if (t.get("seeding_time") or 0) >= days * 86400:
+        return True
+    age_days = (now - done) / 86400
+    return age_days >= max(days, 14.0) or (age_days >= days and t.get("state") in SEEDING_STATES)
+
+
 def classify_removal(raw_paths: list, torrent: Optional[TorrentInfo], keeper_raw: str = "", hnr_days: Optional[float] = None) -> Decision:
     """Decide how to remove ONE losing file. Pure function: no I/O.
 
@@ -127,6 +158,9 @@ def classify_removal(raw_paths: list, torrent: Optional[TorrentInfo], keeper_raw
     if torrent.n_files > MAX_TORRENT_FILES:
         return Decision("REFUSE", f"belongs to a {torrent.n_files}-file pack torrent; a partial delete would break the seed", **base)
     seasoned = torrent.seed_days >= hnr_days
+    if torrent.shared_with and seasoned:
+        # another torrent (another tracker, possibly a young BHD one) points at the very same files: deleting them would kill that seed
+        return Decision("REFUSE", f"{torrent.shared_with} other torrent(s) share these files; deleting would break their seeding", **base)
     if not torrent.covers_exact_path:
         return Decision("LIBRARY_NAME_THEN_DELETE" if seasoned else "LIBRARY_NAME_THEN_TAG",
                         MODES["LIBRARY_NAME_THEN_DELETE" if seasoned else "LIBRARY_NAME_THEN_TAG"],
@@ -164,7 +198,7 @@ def unlink_raw(paths: list, apply: bool, logfile: str = "", why: str = "") -> li
     return out
 
 
-def prune_empty_parents(removed_paths: list, stop_at=("Movies", "tv"), apply: bool = True, logfile: str = "") -> list:
+def prune_empty_parents(removed_paths: list, apply: bool, stop_at=("Movies", "tv"), logfile: str = "") -> list:
     """After removing files, rmdir (never rm -r) the now-empty parent folders of exactly those files, walking up but
     stopping at a library root (.../Media/Movies or .../Media/tv) and at the first non-empty folder. Folders that
     were already empty before (e.g. Radarr's placeholder folders for movies still waiting on a download) are never
@@ -206,10 +240,16 @@ def qbit_delete(session, base_url: str, hash_: str, apply: bool, logfile: str = 
 
 def execute(decision: Decision, session, base_url: str, apply: bool, logfile: str = "", why: str = "") -> list:
     """Carry out a Decision. Returns human-readable outcomes. Dry-run unless apply=True.
-    Order matters: library names are unlinked BEFORE the torrent is removed, never the other way round."""
+    Order matters: library names are unlinked BEFORE the torrent is removed, never the other way round, and if any of those
+    unlinks did not actually happen (file gone, FUSE path refused) the torrent is left completely alone."""
     if decision.mode == "REFUSE":
         return [f"refused: {decision.reason}"]
-    res = [f"{o}: {p}" for p, o in unlink_raw(decision.unlink_raw, apply, logfile, why or decision.mode)]
+    outcomes = unlink_raw(decision.unlink_raw, apply, logfile, why or decision.mode)
+    res = [f"{o}: {p}" for p, o in outcomes]
+    if apply and any(o != "unlinked" for _, o in outcomes):
+        res.append("ABORT: a library name was not unlinked, so the torrent was left untouched")
+        _log(logfile, f"ABORT {decision.torrent_hash}: unlink outcomes {outcomes}")
+        return res
     for label, fn, wanted in (("tag", qbit_tag, decision.tag), ("delete", qbit_delete, decision.delete_torrent)):
         if not wanted:
             continue
@@ -219,6 +259,23 @@ def execute(decision: Decision, session, base_url: str, apply: bool, logfile: st
             _log(logfile, f"QBIT-{label.upper()} {decision.torrent_hash} FAILED: {e}")
             res.append(f"qBit {label} FAILED ({type(e).__name__}); library names were already handled - check the torrent by hand")
     return res
+
+
+def succeeded(lines: list) -> bool:
+    """True only if every line of an execute() result is a success or a dry-run note."""
+    ok = ("unlinked:", "would", "qBit tagged", "qBit deleted", "qBit would")
+    return bool(lines) and all(l.startswith(ok) for l in lines)
+
+
+def keeper_problem(keeper_raws: list) -> str:
+    """Why a keeper cannot be trusted as the surviving copy, or ''. Each must be exactly one physical, regular, non-empty file."""
+    for k in keeper_raws:
+        if len(k) != 1:
+            return "a kept file does not resolve to exactly one physical copy"
+        p = k[0]
+        if os.path.islink(p) or not os.path.isfile(p) or os.path.getsize(p) == 0:
+            return f"the kept file is missing, empty or a symlink: {os.path.basename(p)}"
+    return ""
 
 
 def save_plan(path: str, actions: list):

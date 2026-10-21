@@ -373,11 +373,13 @@ def enrich_with_arr(rec: FileRecord, radarr_idx: dict, sonarr_idx: dict):
 QBIT_SESSION = None
 QBIT_TORRENTS: dict = {}
 QBIT_INDEX: dict = {}
+QBIT_SKIPPED = 0     # torrents whose location could not be indexed; while this is non-zero the seeding check is incomplete
 
 
 def load_qbit_index() -> dict:
     """host path (file or folder) -> torrent hash, for every torrent's content_path."""
-    global QBIT_SESSION, QBIT_TORRENTS
+    global QBIT_SESSION, QBIT_TORRENTS, QBIT_SKIPPED
+    QBIT_SKIPPED = 0
     s = requests.Session()
     login = s.post(f"{QBIT_URL}/api/v2/auth/login", data={"username": QBIT_USER, "password": QBIT_PASS}, timeout=15)
     if login.status_code != 200 or login.text.strip() != "Ok.":
@@ -399,7 +401,10 @@ def load_qbit_index() -> dict:
             if mapped:
                 # Same caution as FileRecord.path_mapped: an unrecognized mount is not
                 # something to guess about, so don't let it participate in the match.
-                index[host_path] = h
+                # A LIST of hashes: the same release cross-seeded to two trackers must not collapse to whichever came last.
+                index.setdefault(host_path, []).append(h)
+            else:
+                QBIT_SKIPPED += 1      # an unknown mount: this torrent's files will look unseeded
             continue
         # content_path is exactly a bare category root ("/tv", "/movies", ...). This could be
         # a genuinely broken/placeholder torrent entry with no real content (the original
@@ -414,21 +419,30 @@ def load_qbit_index() -> dict:
         # folder string would.
         save_path, mapped = to_host_path((t.get("save_path", "") or "").rstrip("/"))
         if not mapped:
+            QBIT_SKIPPED += 1
             continue
         rr = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
         if not rr.ok:
+            QBIT_SKIPPED += 1
             continue
         for f in rr.json():
-            index[os.path.join(save_path, f["name"])] = h
+            index.setdefault(os.path.join(save_path, f["name"]), []).append(h)
     QBIT_INDEX.update(index)
     return index
 
 
-def torrent_hash_for(path: str, qbit_index: dict) -> Optional[str]:
-    for p, h in qbit_index.items():
+def torrent_hashes_for(path: str, qbit_index: dict) -> list:
+    """Every torrent whose tracked file/folder is `path` or contains it (cross-seeds included)."""
+    out = []
+    for p, hs in qbit_index.items():
         if path == p or path.startswith(p + "/"):
-            return h
-    return None
+            out += [h for h in (hs if isinstance(hs, list) else [hs]) if h not in out]
+    return out
+
+
+def torrent_hash_for(path: str, qbit_index: dict) -> Optional[str]:
+    hs = torrent_hashes_for(path, qbit_index)
+    return hs[0] if hs else None
 
 
 def file_age_days(path: str) -> int:
@@ -828,7 +842,7 @@ def reconcile_arr(kept: FileRecord, deleted_tracked: FileRecord) -> None:
             kept_dir = os.path.dirname(kept.path)
             rel = kept_dir.split("/mnt/user/Media/", 1)[1] if "/mnt/user/Media/" in kept_dir else ""
             new_path = "/media/" + rel
-            if rel in ("", "Movies"):
+            if rel in ("", "Movies") or not rel.startswith(("Movies/", "tv/")):
                 console.print(f"    [yellow]{app}: the kept file is a bare file at the library root - move it into a Title (Year) folder first, then rescan. Not changed.[/yellow]")
                 return
             if m.get("path") != new_path:
@@ -884,30 +898,58 @@ PLAN: list = []
 def qbit_n_files(h: str) -> int:
     try:
         r = QBIT_SESSION.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
-        return len(r.json())
+        n = len(r.json())
+        return n if n >= 1 else 999     # an empty answer is "unknown", never "zero files, so not a pack"
     except Exception:
         return 999          # unknown -> treated as a pack -> refused
 
 
 def torrent_for(rec) -> Optional[TorrentInfo]:
     """The torrent that owns rec's data: either rec's own tracked name, or - for a hardlinked LIBRARY name -
-    a seed kept under arr/ (found through the shared inode). None if no torrent claims the data."""
+    a seed kept under arr/ (found through the shared inode). With several torrents on the same data (cross-seeding) the
+    YOUNGEST decides, and the others are counted so a delete that would break them is refused. None if no torrent claims it."""
     if QBIT_SESSION is None:
         return None
-    h = torrent_hash_for(rec.path, QBIT_INDEX)
+    hs = torrent_hashes_for(rec.path, QBIT_INDEX)
     exact = True
-    if not h and len(rec.raw) == 1 and rec.nlink > 1:
+    if not hs and len(rec.raw) == 1 and rec.nlink > 1:
         for n in safe_ops.other_names(rec.raw[0]):
             host = "/mnt/user/" + n.split("/", 3)[3]
-            h = torrent_hash_for(host, QBIT_INDEX)
-            if h:
+            hs = torrent_hashes_for(host, QBIT_INDEX)
+            if hs:
                 exact = False
                 break
-    if not h:
+    if not hs:
         return None
+    def days(h):
+        return (QBIT_TORRENTS.get(h, {}).get("seeding_time", 0) or 0) / 86400.0
+    h = min(hs, key=days)
     t = QBIT_TORRENTS.get(h, {})
-    return TorrentInfo(hash=h, name=t.get("name", h), seed_days=(t.get("seeding_time", 0) or 0) / 86400.0,
-                       category=t.get("category", ""), n_files=qbit_n_files(h), covers_exact_path=exact)
+    return TorrentInfo(hash=h, name=t.get("name", h), seed_days=days(h), category=t.get("category", ""),
+                       n_files=qbit_n_files(h), covers_exact_path=exact, shared_with=len(hs) - 1)
+
+
+def hardlink_problem(rec) -> str:
+    """A file with more names than we can account for is shared with something we cannot see (a seed outside arr/?). Refuse."""
+    if getattr(rec, "nlink", 0) > 1 and len(getattr(rec, "raw", [])) == 1:
+        found = safe_ops.other_names(rec.raw[0])
+        if len(found) < rec.nlink - 1:
+            return f"{rec.nlink} hardlinked names but only {len(found) + 1} found under arr/: another name (a seed?) exists elsewhere"
+    return ""
+
+
+def veto(dec, tinfo, keeper_recs, loser_hash=""):
+    """Last-line checks no classification can see: the keeper must be a real file, and must not be owned by the torrent we
+    are about to delete. Returns a REFUSE Decision or the original."""
+    from safe_ops import Decision
+    prob = safe_ops.keeper_problem([k.raw for k in keeper_recs])
+    if prob:
+        return Decision("REFUSE", prob)
+    if dec.delete_torrent and tinfo:
+        for k in keeper_recs:
+            if tinfo.hash in torrent_hashes_for(k.path, QBIT_INDEX):
+                return Decision("REFUSE", "the file being kept belongs to the same torrent that would be deleted", torrent_hash=tinfo.hash, torrent_name=tinfo.name)
+    return dec
 
 
 def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) -> str:
@@ -920,6 +962,9 @@ def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) 
     kr = rec.raw[0] if rec.raw and rec.raw[0] in keeper_raws else ""
     tinfo = torrent_for(rec)
     dec = classify_removal(rec.raw, tinfo, keeper_raw=kr)
+    if dec.mode != "REFUSE":
+        hp = hardlink_problem(rec)
+        dec = safe_ops.Decision("REFUSE", hp) if hp else veto(dec, tinfo, to_keep)
     seed_note = f" (torrent '{tinfo.name[:40]}', seeded {tinfo.seed_days:.1f}d, {'own name' if tinfo.covers_exact_path else 'seed kept under arr/'})" if tinfo else ""
     console.print(f"    [bold]{dec.mode}[/bold] - {dec.reason}{seed_note}")
     PLAN.append(dict(title=rec.group_title, kind=rec.group_kind, loser=rec.path, keep=[k.path for k in to_keep], mode=dec.mode,
@@ -946,6 +991,10 @@ def require_qbit_for_apply() -> None:
     if APPLY and QBIT_SESSION is None:
         console.print("[bold red]Refusing to --apply: qBittorrent is unreachable, so seeded files cannot be recognised.[/bold red]")
         sys.exit(2)
+    if APPLY and (not QBIT_TORRENTS or QBIT_SKIPPED):
+        console.print(f"[bold red]Refusing to --apply: the qBittorrent index is incomplete ({len(QBIT_TORRENTS)} torrents, {QBIT_SKIPPED} could not be located). "
+                      "Seeded files might look unseeded.[/bold red]")
+        sys.exit(2)
 
 
 def execute_plan(path: str) -> None:
@@ -961,13 +1010,24 @@ def execute_plan(path: str) -> None:
         raw = raw_copies(a["loser"])
         nl = safe_ops.file_identity(raw[0])[2] if len(raw) == 1 and os.path.exists(raw[0]) else 0
         r = SimpleNamespace(path=a["loser"], raw=raw, nlink=nl)
-        keeper_raws = [c[0] for c in (raw_copies(k) for k in a["keep"]) if len(c) == 1]
+        if not a["loser"].startswith(("/mnt/user/Media/Movies/", "/mnt/user/Media/tv/")) or os.path.normpath(a["loser"]) != a["loser"]:
+            console.print(f"  [yellow]SKIP {a['title']}: the plan names a path outside the Movies/tv libraries[/yellow]")
+            continue
+        keeper_recs = [SimpleNamespace(path=k, raw=raw_copies(k)) for k in a["keep"]]
+        keeper_raws = [k.raw[0] for k in keeper_recs if len(k.raw) == 1]
         if not keeper_raws or len(keeper_raws) != len(a["keep"]):
             console.print(f"  [yellow]SKIP {a['title']}: a kept file is missing now - not removing anything[/yellow]")
             continue
-        dec = classify_removal(raw, torrent_for(r), keeper_raw=raw[0] if raw and raw[0] in keeper_raws else "")
-        if dec.mode != a["mode"]:
+        tinfo = torrent_for(r)
+        dec = classify_removal(raw, tinfo, keeper_raw=raw[0] if raw and raw[0] in keeper_raws else "")
+        if dec.mode != "REFUSE":
+            hp = hardlink_problem(r)
+            dec = safe_ops.Decision("REFUSE", hp) if hp else veto(dec, tinfo, keeper_recs)
+        if dec.mode != a["mode"] or (dec.torrent_hash or "") != (a.get("torrent") or ""):
             console.print(f"  [yellow]SKIP {a['title']}: state changed since planning (was {a['mode']}, now {dec.mode}: {dec.reason})[/yellow]")
+            continue
+        if a.get("size") and raw and os.path.exists(raw[0]) and os.path.getsize(raw[0]) != a["size"]:
+            console.print(f"  [yellow]SKIP {a['title']}: the file's size changed since planning[/yellow]")
             continue
         console.print(f"  [bold]{a['title']}[/bold]: {dec.mode}")
         for line in safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"plan {os.path.basename(path)}"):

@@ -307,7 +307,7 @@ def main():
     console.print(table)
 
     if apply:
-        for d in safe_ops.prune_empty_parents(removed_raw, logfile=LOGFILE):
+        for d in safe_ops.prune_empty_parents(removed_raw, True, logfile=LOGFILE):
             log(f"PRUNED empty folder {d}")
         console.print(
             f"\n[bold]Deleted {deleted_count} file(s), freed {fmt_size(deleted_size)}.[/bold]  "

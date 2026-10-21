@@ -1,4 +1,4 @@
-import os, sys, tempfile, unittest
+import os, sys, tempfile, unittest, unittest.mock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import safe_ops as so
 from safe_ops import TorrentInfo, classify_removal, execute, raw_copies
@@ -54,7 +54,7 @@ class PruneTests(unittest.TestCase):
             for f in (a, b, c):
                 with open(f, "w") as fh: fh.write("x")
             os.remove(a); os.remove(b)
-            pruned = so.prune_empty_parents([a, b])
+            pruned = so.prune_empty_parents([a, b], True)
             self.assertEqual(sorted(p.split("Movies/")[1] for p in pruned), ["Gone (2020)", "Gone (2020)/extras"])
             self.assertTrue(os.path.isdir(f"{root}/Keep (2021)"))          # still holds z.mkv
             self.assertTrue(os.path.isdir(f"{root}/Placeholder (2022)"))   # pre-existing empty folder untouched
@@ -133,6 +133,61 @@ class ExecuteTests(unittest.TestCase):
         out = so.unlink_raw(["/mnt/user/Media/Movies/x.mkv"], apply=True); self.assertEqual(out[0][1], "refused: FUSE path")
 
 
+class SecondRoundTests(unittest.TestCase):
+    def test_glob_metacharacters_in_names_are_literal(self):
+        with tempfile.TemporaryDirectory() as d:
+            for p in ("Foo [2020]/a.mkv", "Foo 2/a.mkv", "Who!.mkv"):
+                os.makedirs(os.path.dirname(f"{d}/disk1/Media/Movies/{p}"), exist_ok=True); open(f"{d}/disk1/Media/Movies/{p}", "w").close()
+            g = f"{d}/disk[0-9]*"
+            self.assertEqual([h.split("Movies/")[1] for h in raw_copies("/mnt/user/Media/Movies/Foo [2020]/a.mkv", disk_glob=g)], ["Foo [2020]/a.mkv"])
+            self.assertEqual(raw_copies("/mnt/user/Media/Movies/Who?.mkv", disk_glob=g), [])      # '?' must not match 'Who!.mkv'
+            self.assertEqual(raw_copies("/mnt/user/Media/Movies/Foo *", disk_glob=g), [])
+
+    def test_failed_unlink_aborts_before_touching_the_torrent(self):
+        s = FakeSession()
+        dec = classify_removal(["/nonexistent/disk1/Media/Movies/A/a.mkv"], TorrentInfo("h", "n", 100, covers_exact_path=False))
+        out = execute(dec, s, "http://q", apply=True)
+        self.assertEqual(s.calls, [])
+        self.assertTrue(any(o.startswith("ABORT") for o in out)); self.assertFalse(so.succeeded(out))
+
+    def test_succeeded_requires_every_line_to_be_a_success(self):
+        self.assertTrue(so.succeeded(["unlinked: /x", "qBit deleted"]))
+        self.assertTrue(so.succeeded(["would unlink: /x", "qBit would delete torrent+files"]))
+        self.assertFalse(so.succeeded(["unlinked: /x", "qBit delete failed HTTP 500"]))
+        self.assertFalse(so.succeeded(["missing: /x"])); self.assertFalse(so.succeeded([]))
+
+    def test_shared_torrent_files_are_never_deleted(self):
+        d = classify_removal(["/mnt/disk1/Media/Movies/A/a.mkv"], TorrentInfo("h", "n", 200, shared_with=1))
+        self.assertEqual(d.mode, "REFUSE"); self.assertFalse(d.delete_torrent)
+        # a young shared torrent is only tagged (never deleted), which is safe
+        self.assertEqual(classify_removal(["/mnt/disk1/Media/Movies/A/a.mkv"], TorrentInfo("h", "n", 1, shared_with=1)).mode, "TAG_ONLY")
+
+    def test_keeper_must_be_one_real_file(self):
+        d = tempfile.mkdtemp(); real = os.path.join(d, "k.mkv"); open(real, "w").write("x")
+        link = os.path.join(d, "l.mkv"); os.symlink(real, link); empty = os.path.join(d, "e.mkv"); open(empty, "w").close()
+        self.assertEqual(so.keeper_problem([[real]]), "")
+        for bad in ([[link]], [[empty]], [[os.path.join(d, "gone.mkv")]], [[real, real]], [[]]):
+            self.assertTrue(so.keeper_problem(bad), bad)
+
+    def test_hnr_threshold_cannot_be_zeroed_by_environment(self):
+        with unittest.mock.patch.dict(os.environ, {"HNR_MIN_SEED_DAYS": "0"}):
+            self.assertGreaterEqual(so._env_days("HNR_MIN_SEED_DAYS", "30", 5.0), 5.0)
+        with unittest.mock.patch.dict(os.environ, {"HNR_MIN_SEED_DAYS": "abc"}):
+            self.assertEqual(so._env_days("HNR_MIN_SEED_DAYS", "30", 5.0), 30.0)
+
+    def test_seed_rule(self):
+        now = 10_000_000
+        t = lambda **k: dict(completion_on=now - 3600, ratio=0, seeding_time=0, state="stalledUP", **k)  # noqa: E731
+        self.assertFalse(so.seed_rule_met(dict(t(), completion_on=-1), now))          # never completed is not "ancient"
+        self.assertFalse(so.seed_rule_met(dict(t(), completion_on=0), now))
+        self.assertTrue(so.seed_rule_met(dict(t(), ratio=1.0), now))
+        self.assertTrue(so.seed_rule_met(dict(t(), seeding_time=121 * 3600), now))
+        self.assertTrue(so.seed_rule_met(dict(t(), completion_on=now - 6 * 86400), now))                     # actively seeding for 6 days
+        self.assertFalse(so.seed_rule_met(dict(t(), completion_on=now - 6 * 86400, state="pausedUP"), now))  # paused: wall time is not seeding time
+        self.assertFalse(so.seed_rule_met(dict(t(), completion_on=now - 6 * 86400, state="missingFiles"), now))
+        self.assertTrue(so.seed_rule_met(dict(t(), completion_on=now - 20 * 86400, state="pausedUP"), now))
+
+
 class HardeningTests(unittest.TestCase):
     def test_raw_copies_refuses_path_traversal(self):
         with tempfile.TemporaryDirectory() as d:
@@ -145,12 +200,12 @@ class HardeningTests(unittest.TestCase):
             # a seed folder under arr/ that empties out must NOT be pruned (qBittorrent's save path lives there)
             os.makedirs(f"{d}/disk1/Media/arr/movies/Seed"); f = f"{d}/disk1/Media/arr/movies/Seed/x.mkv"
             open(f, "w").close(); os.remove(f)
-            self.assertEqual(so.prune_empty_parents([f]), [])
+            self.assertEqual(so.prune_empty_parents([f], True), [])
             self.assertTrue(os.path.isdir(f"{d}/disk1/Media/arr/movies/Seed"))
             # an emptied library tree stops at the library root, never removing Media itself
             os.makedirs(f"{d}/disk1/Media/Movies/Only (2020)"); g = f"{d}/disk1/Media/Movies/Only (2020)/o.mkv"
             open(g, "w").close(); os.remove(g)
-            self.assertEqual(so.prune_empty_parents([g]), [f"{d}/disk1/Media/Movies/Only (2020)"])
+            self.assertEqual(so.prune_empty_parents([g], True), [f"{d}/disk1/Media/Movies/Only (2020)"])
             self.assertTrue(os.path.isdir(f"{d}/disk1/Media/Movies")); self.assertTrue(os.path.isdir(f"{d}/disk1/Media"))
 
     def test_qbit_failure_after_unlink_is_reported_not_raised(self):
