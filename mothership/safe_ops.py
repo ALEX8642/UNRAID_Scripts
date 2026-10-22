@@ -184,6 +184,11 @@ def _log(logfile: str, msg: str):
     if not logfile:
         return
     os.makedirs(os.path.dirname(logfile), exist_ok=True)
+    try:
+        if os.path.getsize(logfile) > 5 * 1024 * 1024:       # simple rotation: one previous generation, so logs cannot grow without bound
+            os.replace(logfile, logfile + ".1")
+    except OSError:
+        pass
     with open(logfile, "a") as f:
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 

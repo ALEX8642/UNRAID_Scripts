@@ -8,9 +8,10 @@ the job's numbers: every removal is re-classified against the CURRENT state with
 `apply` job only runs if the decisions still match the plan you confirmed (plan_digest).
 
 Job files:  JOBS_DIR/pending/<id>.json   -> processed -> JOBS_DIR/done/<id>.json (result added)
-  {"id": "...", "type": "delete_files"|"poster_reset", "apply": false, "plan_digest": "", "created": epoch, ...type fields}
+  {"id": "...", "type": "delete_files"|"poster_reset"|"restore_quarantine", "apply": false, "plan_digest": "", "created": epoch, ...type fields}
   delete_files:  app ("radarr"|"sonarr"), arr_id, title, paths [/media/... file paths Radarr/Sonarr track], remove_record (bool)
   poster_reset:  title
+  restore_quarantine: items ["YYYY-MM-DD/path/under/Media", ...]  (plan -> digest -> apply; never overwrites)
 A dry-run job (apply=false) returns the plan in "lines" and a "digest". The matching apply job must carry that digest.
 
 Usage:  python3 job_runner.py             # process everything pending
@@ -194,12 +195,45 @@ def run_delete(job, dr):
 
 
 # ---------------------------------------------------------------------------
+# restore_quarantine: put quarantined files back (same plan -> digest -> apply flow; never overwrites)
+# ---------------------------------------------------------------------------
+
+def run_restore(job):
+    import quarantine as qt
+    items = job.get("items")
+    if not isinstance(items, list) or not items or len(items) > 500 or not all(isinstance(i, str) for i in items) or len(set(items)) != len(items):
+        return {"ok": False, "lines": ["malformed job: needs a non-empty list (max 500) of unique 'YYYY-MM-DD/path' strings"]}
+    rows = qt.plan_restore(items)
+    digest = digest_of([(r["item"], r["src"], r["dst"], r["problem"]) for r in rows])
+    lines = [f"{'OK  ' if not r['problem'] else 'SKIP'} {r['item']}" + (f"  ({r['problem']})" if r["problem"] else "") for r in rows]
+    if job.get("apply") is not True:
+        return {"ok": True, "digest": digest, "lines": lines + ["", f"{sum(1 for r in rows if not r['problem'])} file(s) can be restored. Rescan the library afterwards."]}
+    if job.get("plan_digest") != digest:
+        return {"ok": False, "digest": "", "lines": ["State changed since you confirmed the plan. Nothing was done - plan again."]}
+    out = qt.do_restore(rows)
+    log(f"RESTORE job: {out}")
+    return {"ok": all(o == "restored" or o.startswith("skipped") for _, o in out), "digest": "", "lines": [f"{o}: {i}" for i, o in out]}
+
+
+# ---------------------------------------------------------------------------
 # poster_reset  (same effect as kometa/repick-poster.sh: forget Kometa's saved original and its Overlay label)
 # ---------------------------------------------------------------------------
 
+def plex_section(kind):
+    """Library id by type ('movie'/'show'); never a hard-coded 1/2."""
+    h = {"X-Plex-Token": PLEX_TOKEN, "Accept": "application/json"}
+    r = requests.get(f"{PLEX_URL}/library/sections", headers=h, timeout=30)
+    r.raise_for_status()
+    for d in r.json()["MediaContainer"].get("Directory", []):
+        if d.get("type") == kind:
+            return d["key"]
+    raise RuntimeError(f"no Plex library of type {kind}")
+
+
 def run_poster_reset(job):
     h = {"X-Plex-Token": PLEX_TOKEN, "Accept": "application/json"}
-    r = requests.get(f"{PLEX_URL}/library/sections/1/all", params={"type": 1, "title": job["title"]}, headers=h, timeout=60)
+    sec = plex_section("movie")
+    r = requests.get(f"{PLEX_URL}/library/sections/{sec}/all", params={"type": 1, "title": job["title"]}, headers=h, timeout=60)
     r.raise_for_status()
     items = [m for m in r.json()["MediaContainer"].get("Metadata", []) if m["title"] == job["title"]]
     lines = []
@@ -210,7 +244,7 @@ def run_poster_reset(job):
         if job["apply"]:
             for b in backups:
                 os.remove(b)
-            requests.put(f"{PLEX_URL}/library/sections/1/all", params={"type": 1, "id": key, "label[].tag.tag-": "Overlay"}, headers=h, timeout=60).raise_for_status()
+            requests.put(f"{PLEX_URL}/library/sections/{sec}/all", params={"type": 1, "id": key, "label[].tag.tag-": "Overlay"}, headers=h, timeout=60).raise_for_status()
             log(f"POSTER-RESET {m['title']} {key}")
     if not items:
         return {"ok": False, "lines": [f"no movie titled '{job['title']}' in Plex"]}
@@ -287,6 +321,8 @@ def process(path, dr, job=None):
             result = run_delete(job, dr)
         elif job.get("type") == "poster_reset":
             result = run_poster_reset(job)
+        elif job.get("type") == "restore_quarantine":
+            result = run_restore(job)
         else:
             result = {"ok": False, "lines": [f"unknown job type {clean(repr(job.get('type')))}"]}
     except Exception as e:  # noqa: BLE001 - always write a result so the page does not wait forever

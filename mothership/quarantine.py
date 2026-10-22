@@ -93,6 +93,64 @@ def purge(older_than_days, apply, today=None):
     return gone, freed
 
 
+LIB_UID, LIB_GID = int(os.environ.get("LIB_UID", "99")), int(os.environ.get("LIB_GID", "100"))      # nobody:users, what Radarr/Sonarr run as
+
+
+def make_library_dirs(path):
+    """makedirs, then give every directory THIS call created nobody:users 777 (a root-owned folder in the library blocks Radarr/Sonarr upgrades)."""
+    todo = []
+    d = path
+    while d and not os.path.isdir(d):
+        todo.append(d)
+        d = os.path.dirname(d)
+    os.makedirs(path, exist_ok=True)
+    for d in todo:
+        try:
+            os.chown(d, LIB_UID, LIB_GID)
+            os.chmod(d, 0o777)
+        except PermissionError:
+            pass              # not root (tests, dry setups): nothing to fix
+
+
+def plan_restore(items):
+    """items: ['YYYY-MM-DD/Movies/Title/file.mkv', ...] -> [{item, src, dst, problem}] (problem '' when restorable). Changes nothing."""
+    out = []
+    for it in items:
+        day, _, rel = it.partition("/")
+        row = {"item": it, "src": "", "dst": "", "problem": ""}
+        if not DAY.match(day) or not rel or ".." in rel.split("/") or rel.startswith("/"):
+            row["problem"] = "not a quarantine path"
+        else:
+            hits = [r for r in roots() if os.path.isfile(os.path.join(r, "Media", ".quarantine", day, rel)) and not os.path.islink(os.path.join(r, "Media", ".quarantine", day, rel))]
+            if len(hits) != 1:
+                row["problem"] = f"expected exactly one quarantined copy, found {len(hits)}"
+            else:
+                row["src"] = os.path.join(hits[0], "Media", ".quarantine", day, rel)
+                row["dst"] = os.path.join(hits[0], "Media", rel)
+                if os.path.lexists(row["dst"]):
+                    row["problem"] = "a file already exists at the original location; not overwriting"
+        out.append(row)
+    return out
+
+
+def do_restore(rows):
+    """Move each restorable row back. Returns [(item, outcome)]. Never overwrites."""
+    res = []
+    for r in rows:
+        if r["problem"]:
+            res.append((r["item"], "skipped: " + r["problem"]))
+            continue
+        try:
+            if os.path.lexists(r["dst"]):
+                res.append((r["item"], "skipped: destination exists")); continue
+            make_library_dirs(os.path.dirname(r["dst"]))
+            os.rename(r["src"], r["dst"])
+            res.append((r["item"], "restored"))
+        except OSError as e:
+            res.append((r["item"], f"failed: {e}"))
+    return res
+
+
 def restore(day_rel, apply):
     day, _, rel = day_rel.partition("/")
     if not DAY.match(day) or not rel or ".." in rel.split("/"):
@@ -106,7 +164,7 @@ def restore(day_rel, apply):
         raise SystemExit(f"{dst} already exists; not overwriting")
     print(f"{'RESTORE' if apply else 'WOULD RESTORE'} {src} -> {dst}")
     if apply:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        make_library_dirs(os.path.dirname(dst))
         os.rename(src, dst)
 
 

@@ -228,7 +228,7 @@ class Poster(unittest.TestCase):
     def test_reset_removes_backup_and_label_only_on_apply(self):
         k = tempfile.mkdtemp(); os.makedirs(f"{k}/overlays/Movies Original Posters"); b = f"{k}/overlays/Movies Original Posters/55.jpg"; open(b, "w").close()
         rq = mock.MagicMock(); rq.get.return_value.json.return_value = {"MediaContainer": {"Metadata": [{"title": "Rambo", "year": 2019, "ratingKey": "55"}]}}
-        with mock.patch.object(jr, "requests", rq), mock.patch.object(jr, "KOMETA_DIR", k), mock.patch.object(jr, "log"):
+        with mock.patch.object(jr, "requests", rq), mock.patch.object(jr, "KOMETA_DIR", k), mock.patch.object(jr, "log"), mock.patch.object(jr, "plex_section", return_value="7"):
             jr.run_poster_reset({"title": "Rambo", "apply": False})
             self.assertTrue(os.path.exists(b)); rq.put.assert_not_called()
             res = jr.run_poster_reset({"title": "Rambo", "apply": True})
@@ -236,9 +236,45 @@ class Poster(unittest.TestCase):
 
     def test_unknown_title_does_nothing(self):
         rq = mock.MagicMock(); rq.get.return_value.json.return_value = {"MediaContainer": {}}
-        with mock.patch.object(jr, "requests", rq):
+        with mock.patch.object(jr, "requests", rq), mock.patch.object(jr, "plex_section", return_value="7"):
             self.assertFalse(jr.run_poster_reset({"title": "Nope", "apply": True})["ok"])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RestoreJob(unittest.TestCase):
+    def setUp(self):
+        import quarantine
+        self.q = quarantine
+        self.mnt = tempfile.mkdtemp()
+        self.p = mock.patch.object(quarantine, "MNT", self.mnt); self.p.start()
+        self.f = os.path.join(self.mnt, "disk1", "Media", ".quarantine", "2026-10-21", "Movies", "A", "a.mkv")
+        os.makedirs(os.path.dirname(self.f)); open(self.f, "w").write("x")
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_plan_then_apply_restores_and_a_stale_digest_does_nothing(self):
+        j = {"items": ["2026-10-21/Movies/A/a.mkv"], "apply": False}
+        plan = jr.run_restore(j)
+        self.assertTrue(plan["ok"]); self.assertTrue(os.path.exists(self.f))
+        bad = jr.run_restore(dict(j, apply=True, plan_digest="nope"))
+        self.assertFalse(bad["ok"]); self.assertTrue(os.path.exists(self.f))
+        with mock.patch.object(jr, "log"):
+            good = jr.run_restore(dict(j, apply=True, plan_digest=plan["digest"]))
+        self.assertTrue(good["ok"]); self.assertFalse(os.path.exists(self.f)); self.assertTrue(os.path.exists(f"{self.mnt}/disk1/Media/Movies/A/a.mkv"))
+
+    def test_malformed_item_lists_are_refused(self):
+        for items in ([], "x", ["a", "a"], [1], ["x"] * 600):
+            self.assertFalse(jr.run_restore({"items": items, "apply": False})["ok"], items)
+
+
+class PlexSections(unittest.TestCase):
+    def test_section_is_found_by_type_not_by_number(self):
+        rq = mock.MagicMock(); rq.get.return_value.json.return_value = {"MediaContainer": {"Directory": [{"key": "9", "type": "artist"}, {"key": "4", "type": "movie"}, {"key": "5", "type": "show"}]}}
+        with mock.patch.object(jr, "requests", rq):
+            self.assertEqual((jr.plex_section("movie"), jr.plex_section("show")), ("4", "5"))
+            with self.assertRaises(RuntimeError):
+                jr.plex_section("photo")

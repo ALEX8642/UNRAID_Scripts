@@ -54,3 +54,32 @@ class Quarantine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RestorePlanApply(unittest.TestCase):
+    def setUp(self):
+        self.mnt = tempfile.mkdtemp()
+        self.p = mock.patch.object(q, "MNT", self.mnt); self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_plan_changes_nothing_and_flags_problems(self):
+        a = mk(self.mnt, "disk1", "2026-10-21", "Movies/A/a.mkv")
+        os.makedirs(f"{self.mnt}/disk1/Media/Movies/B"); open(f"{self.mnt}/disk1/Media/Movies/B/b.mkv", "w").close()
+        mk(self.mnt, "disk1", "2026-10-21", "Movies/B/b.mkv")
+        rows = q.plan_restore(["2026-10-21/Movies/A/a.mkv", "2026-10-21/Movies/B/b.mkv", "2026-10-21/../../etc/passwd", "bad/Movies/x", "2026-10-21/Movies/Z/none.mkv"])
+        self.assertEqual([bool(r["problem"]) for r in rows], [False, True, True, True, True]); self.assertTrue(os.path.exists(a))
+
+    def test_do_restore_moves_back_and_never_overwrites(self):
+        mk(self.mnt, "disk1", "2026-10-21", "Movies/A/a.mkv", b"quarantined")
+        out = q.do_restore(q.plan_restore(["2026-10-21/Movies/A/a.mkv"]))
+        self.assertEqual(out[0][1], "restored"); self.assertEqual(open(f"{self.mnt}/disk1/Media/Movies/A/a.mkv", "rb").read(), b"quarantined")
+        mk(self.mnt, "disk1", "2026-10-22", "Movies/A/a.mkv", b"second")
+        out = q.do_restore(q.plan_restore(["2026-10-22/Movies/A/a.mkv"]))
+        self.assertTrue(out[0][1].startswith("skipped")); self.assertEqual(open(f"{self.mnt}/disk1/Media/Movies/A/a.mkv", "rb").read(), b"quarantined")
+
+    def test_symlinked_quarantine_entry_is_not_restorable(self):
+        os.makedirs(f"{self.mnt}/disk1/Media/.quarantine/2026-10-21/Movies/A"); target = f"{self.mnt}/target"; open(target, "w").close()
+        os.symlink(target, f"{self.mnt}/disk1/Media/.quarantine/2026-10-21/Movies/A/l.mkv")
+        self.assertTrue(q.plan_restore(["2026-10-21/Movies/A/l.mkv"])[0]["problem"])
