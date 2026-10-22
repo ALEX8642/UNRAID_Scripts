@@ -110,6 +110,10 @@ class IndexLoading(unittest.TestCase):
         self.load([{"hash": "h1", "content_path": "/data/downloads/x", "save_path": "/data/downloads"}])
         self.assertEqual(dr.QBIT_SKIPPED, 1)
 
+    def test_music_and_other_non_library_roots_are_not_counted_as_unindexable(self):
+        self.load([{"hash": "m1", "content_path": "/music/Album", "save_path": "/music"}, {"hash": "m2", "content_path": "/stash/x", "save_path": "/stash"}])
+        self.assertEqual(dr.QBIT_SKIPPED, 0)
+
     def test_known_torrents_are_indexed_as_lists(self):
         idx = self.load([{"hash": "h1", "content_path": "/movies/X (2020)", "save_path": "/movies"}, {"hash": "h2", "content_path": "/movies/X (2020)", "save_path": "/movies"}])
         self.assertEqual(idx["/mnt/user/Media/Movies/X (2020)"], ["h1", "h2"]); self.assertEqual(dr.QBIT_SKIPPED, 0)

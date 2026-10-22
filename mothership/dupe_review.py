@@ -374,6 +374,8 @@ QBIT_SESSION = None
 QBIT_TORRENTS: dict = {}
 QBIT_INDEX: dict = {}
 QBIT_SKIPPED = 0     # torrents whose location could not be indexed; while this is non-zero the seeding check is incomplete
+# qBittorrent mounts that can never hold library files (music, adult, software...). Torrents there are irrelevant, not "unindexable".
+NON_LIBRARY_ROOTS = tuple(r for r in os.environ.get("NON_LIBRARY_ROOTS", "/music,/musicvideos,/stash,/VR,/software,/downloads/incomplete,/run").split(",") if r)
 
 
 def load_qbit_index() -> dict:
@@ -403,8 +405,8 @@ def load_qbit_index() -> dict:
                 # something to guess about, so don't let it participate in the match.
                 # A LIST of hashes: the same release cross-seeded to two trackers must not collapse to whichever came last.
                 index.setdefault(host_path, []).append(h)
-            else:
-                QBIT_SKIPPED += 1      # an unknown mount: this torrent's files will look unseeded
+            elif not cp.startswith(NON_LIBRARY_ROOTS):
+                QBIT_SKIPPED += 1      # an unknown mount that is not a known non-library root: its files would look unseeded
             continue
         # content_path is exactly a bare category root ("/tv", "/movies", ...). This could be
         # a genuinely broken/placeholder torrent entry with no real content (the original
@@ -419,7 +421,8 @@ def load_qbit_index() -> dict:
         # folder string would.
         save_path, mapped = to_host_path((t.get("save_path", "") or "").rstrip("/"))
         if not mapped:
-            QBIT_SKIPPED += 1
+            if not save_path.startswith(NON_LIBRARY_ROOTS):
+                QBIT_SKIPPED += 1
             continue
         rr = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
         if not rr.ok:
