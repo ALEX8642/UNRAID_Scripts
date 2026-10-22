@@ -207,7 +207,8 @@ def run_restore(job):
     digest = digest_of([(r["item"], r["src"], r["dst"], r["problem"]) for r in rows])
     lines = [f"{'OK  ' if not r['problem'] else 'SKIP'} {r['item']}" + (f"  ({r['problem']})" if r["problem"] else "") for r in rows]
     if job.get("apply") is not True:
-        return {"ok": True, "digest": digest, "lines": lines + ["", f"{sum(1 for r in rows if not r['problem'])} file(s) can be restored. Rescan the library afterwards."]}
+        n_ok = sum(1 for r in rows if not r["problem"])
+        return {"ok": n_ok > 0, "digest": digest if n_ok else "", "lines": lines + ["", f"{n_ok} file(s) can be restored." + (" Rescan the library afterwards." if n_ok else " Nothing to apply.")]}
     if job.get("plan_digest") != digest:
         return {"ok": False, "digest": "", "lines": ["State changed since you confirmed the plan. Nothing was done - plan again."]}
     out = qt.do_restore(rows)

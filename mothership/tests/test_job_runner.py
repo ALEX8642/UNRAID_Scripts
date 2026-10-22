@@ -266,6 +266,10 @@ class RestoreJob(unittest.TestCase):
             good = jr.run_restore(dict(j, apply=True, plan_digest=plan["digest"]))
         self.assertTrue(good["ok"]); self.assertFalse(os.path.exists(self.f)); self.assertTrue(os.path.exists(f"{self.mnt}/disk1/Media/Movies/A/a.mkv"))
 
+    def test_nothing_restorable_offers_no_apply(self):
+        res = jr.run_restore({"items": ["2026-01-01/Movies/None/none.mkv"], "apply": False})
+        self.assertFalse(res["ok"]); self.assertEqual(res["digest"], "")
+
     def test_malformed_item_lists_are_refused(self):
         for items in ([], "x", ["a", "a"], [1], ["x"] * 600):
             self.assertFalse(jr.run_restore({"items": items, "apply": False})["ok"], items)
