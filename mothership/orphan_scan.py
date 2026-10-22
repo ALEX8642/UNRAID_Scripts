@@ -43,6 +43,8 @@ MIN_SIZE_BYTES = 10_000_000  # 10MB floor — excludes stray thumbnail/artifact 
 RECENT_HOURS = 24  # files newer than this are flagged, not confidently called orphaned
 
 LOGFILE = "/logs/orphan-scan.log"
+MAX_DELETE_FILES = int(os.environ.get("ORPHAN_MAX_FILES", "25"))          # per --apply run: more than this looks like a broken index, not 25 orphans
+MAX_DELETE_BYTES = int(float(os.environ.get("ORPHAN_MAX_GB", "300")) * 1024**3)
 # ==== END CONFIG ====
 
 # ==== CONFIG — credentials: set via a .env file (see .env.example), never hardcode here ====
@@ -256,6 +258,10 @@ def main():
         table.add_column("Result")
 
     removed_raw = []
+    fresh = None
+    if apply:
+        # the scan took minutes: ask qBittorrent again right before deleting, so a torrent added meanwhile is respected
+        fresh = find_orphans(on_disk, plex_known, load_qbit_known(), load_arr_known())
     total_size = 0
     recent_count = 0
     deleted_count = 0
@@ -280,6 +286,12 @@ def main():
             log(f"EXCLUDED (--exclude): {path}")
         elif recent:
             result = "[yellow]skipped (recent)[/yellow]"
+        elif path not in fresh:
+            result = "[yellow]skipped (claimed since the scan started)[/yellow]"
+            log(f"SKIPPED {path}: claimed by qBittorrent/Radarr/Sonarr since the scan")
+        elif deleted_count >= MAX_DELETE_FILES or deleted_size + size > MAX_DELETE_BYTES:
+            result = "[yellow]skipped (per-run limit reached; investigate before raising it)[/yellow]"
+            log(f"LIMIT {path}: per-run limit of {MAX_DELETE_FILES} files / {fmt_size(MAX_DELETE_BYTES)} reached")
         else:
             # Never write through /mnt/user: resolve the physical disk copy and unlink it there. Refuse anything
             # that is hardlinked elsewhere (shared data: some other name, e.g. a seed in arr/, still needs it)

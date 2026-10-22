@@ -843,7 +843,7 @@ def reconcile_arr(kept: FileRecord, deleted_tracked: FileRecord) -> None:
         if movie:
             m = requests.get(f"{base}/api/v3/movie/{deleted_tracked.arr_id}", headers=hdr, timeout=30).json()
             kept_dir = os.path.dirname(kept.path)
-            rel = kept_dir.split("/mnt/user/Media/", 1)[1] if "/mnt/user/Media/" in kept_dir else ""
+            rel = kept_dir.split(safe_ops.USER_PREFIX + "Media/", 1)[1] if (safe_ops.USER_PREFIX + "Media/") in kept_dir else ""
             new_path = "/media/" + rel
             if rel in ("", "Movies") or not rel.startswith(("Movies/", "tv/")):
                 console.print(f"    [yellow]{app}: the kept file is a bare file at the library root - move it into a Title (Year) folder first, then rescan. Not changed.[/yellow]")
@@ -917,7 +917,7 @@ def torrent_for(rec) -> Optional[TorrentInfo]:
     exact = True
     if not hs and len(rec.raw) == 1 and rec.nlink > 1:
         for n in safe_ops.other_names(rec.raw[0]):
-            host = "/mnt/user/" + n.split("/", 3)[3]
+            host = safe_ops.USER_PREFIX + "Media/" + n.split("/Media/", 1)[1]
             hs = torrent_hashes_for(host, QBIT_INDEX)
             if hs:
                 exact = False
@@ -955,6 +955,10 @@ def veto(dec, tinfo, keeper_recs, loser_hash=""):
     return dec
 
 
+MAX_REMOVALS_PER_SESSION = int(os.environ.get("DUPE_MAX_REMOVALS", "50"))
+_removals = {"n": 0}
+
+
 def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) -> str:
     """Decide how to remove `rec` (safe_ops.classify_removal), record it in the plan and - only with --apply, after a
     y/N confirmation - execute it. Returns 'planned' (dry run), 'deleted', 'tagged' (kept seeding + tagged), 'declined', 'error'."""
@@ -975,6 +979,9 @@ def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) 
     if dec.mode == "REFUSE":
         log(f"REFUSED {rec.path}: {dec.reason}")
         return "error"
+    if APPLY and _removals["n"] >= MAX_REMOVALS_PER_SESSION:
+        console.print(f"    [yellow]Per-session limit of {MAX_REMOVALS_PER_SESSION} removals reached; stopping here. Start a new session to continue.[/yellow]")
+        return "declined"
     if APPLY:
         ans = Prompt.ask("    Execute this removal? [y/N]", default="n").strip().lower()
         if ans != "y":
@@ -983,6 +990,8 @@ def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) 
     for line in safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"dupe-review keep={[k.path for k in to_keep]}"):
         console.print(f"      {line}")
     removed = bool(dec.unlink_raw or dec.delete_torrent)
+    if APPLY and removed:
+        _removals["n"] += 1
     if not APPLY:
         return "planned" if removed else "tagged"
     return "deleted" if removed else "tagged"
@@ -1013,7 +1022,7 @@ def execute_plan(path: str) -> None:
         raw = raw_copies(a["loser"])
         nl = safe_ops.file_identity(raw[0])[2] if len(raw) == 1 and os.path.exists(raw[0]) else 0
         r = SimpleNamespace(path=a["loser"], raw=raw, nlink=nl)
-        if not a["loser"].startswith(("/mnt/user/Media/Movies/", "/mnt/user/Media/tv/")) or os.path.normpath(a["loser"]) != a["loser"]:
+        if not a["loser"].startswith((safe_ops.USER_PREFIX + "Media/Movies/", safe_ops.USER_PREFIX + "Media/tv/")) or os.path.normpath(a["loser"]) != a["loser"]:
             console.print(f"  [yellow]SKIP {a['title']}: the plan names a path outside the Movies/tv libraries[/yellow]")
             continue
         keeper_recs = [SimpleNamespace(path=k, raw=raw_copies(k)) for k in a["keep"]]

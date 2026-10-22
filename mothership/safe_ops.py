@@ -16,6 +16,7 @@ Pure decision logic (classify_removal) is separated from side effects (execute) 
 unit-tested without a server. See tests/test_safe_ops.py.
 """
 
+import datetime
 import glob
 import json
 import os
@@ -24,6 +25,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 TAG_DELETE_LATER = "delete-later"
+QUARANTINE = ".quarantine"      # <disk>/Media/.quarantine/<YYYY-MM-DD>/<path under Media>; purged by quarantine_purge.py after a week
 # Conservative stand-in for tracker hit-and-run rules (which are members-only and vary):
 # a torrent seeded for fewer days than this is treated as possibly still inside its window.
 def _env_days(name, default, floor):
@@ -40,8 +42,9 @@ SEEDING_STATES = ("uploading", "stalledUP", "queuedUP", "forcedUP", "checkingUP"
 # Torrents with more than this many files are treated as packs: never deleted per file.
 MAX_TORRENT_FILES = 3
 # Where the physical array disks live (overridable for tests).
-DISK_GLOB = os.environ.get("MOTHERSHIP_DISK_GLOB", "/mnt/disk[0-9]*")
-USER_PREFIX = "/mnt/user/"
+MNT = os.environ.get("MOTHERSHIP_MNT", "/mnt")
+DISK_GLOB = os.environ.get("MOTHERSHIP_DISK_GLOB", MNT + "/disk[0-9]*")
+USER_PREFIX = MNT + "/user/"
 
 
 def raw_copies(host_path: str, disk_glob: Optional[str] = None) -> list:
@@ -102,7 +105,8 @@ class Decision:
     mode: str                         # see MODES
     reason: str
     unlink_raw: list = field(default_factory=list)   # physical library names to unlink
-    delete_torrent: bool = False                      # then remove the torrent + files via qBittorrent's API
+    delete_torrent: bool = False                      # then remove the torrent via qBittorrent's API
+    delete_files: bool = False                        # ... and its files too (only when the data stays reachable through a quarantined name)
     tag: bool = False                                 # keep the torrent seeding, tag it delete-later
     torrent_hash: str = ""
     torrent_name: str = ""
@@ -115,7 +119,7 @@ MODES = {
     "UNLINK": "no torrent owns this file: unlink the physical copy",
     "LIBRARY_NAME_THEN_DELETE": "library name is a hardlink of a seed kept elsewhere (arr/), seeded long enough: unlink the library name, then remove the torrent + files via qBittorrent",
     "LIBRARY_NAME_THEN_TAG": "library name is a hardlink of a seed kept elsewhere (arr/), possibly inside a hit-and-run window: unlink only the Plex-visible name, keep seeding, tag delete-later",
-    "QBIT_DELETE": "the torrent's own tracked name, seeded long enough: remove the torrent + files via qBittorrent's API",
+    "QBIT_DELETE": "the torrent's own tracked name, seeded long enough: quarantine the file, then remove the torrent from qBittorrent (files are NOT deleted by qBittorrent)",
     "TAG_ONLY": "the torrent's own tracked name and the window may be open: unlinking would break the seed, so only tag delete-later and leave the files (hide it later by relocating the seed)",
     "REFUSE": "refused for safety",
 }
@@ -164,9 +168,9 @@ def classify_removal(raw_paths: list, torrent: Optional[TorrentInfo], keeper_raw
     if not torrent.covers_exact_path:
         return Decision("LIBRARY_NAME_THEN_DELETE" if seasoned else "LIBRARY_NAME_THEN_TAG",
                         MODES["LIBRARY_NAME_THEN_DELETE" if seasoned else "LIBRARY_NAME_THEN_TAG"],
-                        unlink_raw=list(raw_paths), delete_torrent=seasoned, tag=not seasoned, **base)
+                        unlink_raw=list(raw_paths), delete_torrent=seasoned, delete_files=seasoned, tag=not seasoned, **base)
     if seasoned:
-        return Decision("QBIT_DELETE", MODES["QBIT_DELETE"], delete_torrent=True, **base)
+        return Decision("QBIT_DELETE", MODES["QBIT_DELETE"], unlink_raw=list(raw_paths), delete_torrent=True, delete_files=False, **base)
     return Decision("TAG_ONLY", MODES["TAG_ONLY"], tag=True, **base)
 
 
@@ -182,19 +186,42 @@ def _log(logfile: str, msg: str):
         f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 
+def quarantine_path(p: str, today: str = "") -> str:
+    """/mnt/disk3/Media/Movies/A/a.mkv -> /mnt/disk3/Media/.quarantine/2026-10-22/Movies/A/a.mkv (same disk, so a rename)."""
+    if "/Media/" not in p:
+        raise ValueError(f"not under a Media folder: {p}")
+    root, rel = p.split("/Media/", 1)
+    if rel.split("/", 1)[0] == QUARANTINE:
+        raise ValueError("already in quarantine")
+    today = today or datetime.date.today().isoformat()
+    dest = os.path.join(root, "Media", QUARANTINE, today, rel)
+    n, cand = 1, dest
+    while os.path.lexists(cand):
+        n += 1
+        cand = f"{dest}.{n}"
+    return cand
+
+
 def unlink_raw(paths: list, apply: bool, logfile: str = "", why: str = "") -> list:
-    """Unlink physical files. Returns list of (path, outcome). Never touches /mnt/user paths."""
+    """'Remove' physical files by MOVING them into the same disk's .quarantine (a rename: instant, no extra space, fully
+    reversible until quarantine_purge.py empties it). Never touches /mnt/user paths. Returns [(path, outcome)]."""
     out = []
     for p in paths:
         if p.startswith(USER_PREFIX):
             out.append((p, "refused: FUSE path")); continue
-        if not os.path.isfile(p):
+        if os.path.islink(p) or not os.path.isfile(p):
             out.append((p, "missing")); continue
         if not apply:
-            out.append((p, "would unlink")); continue
-        os.remove(p)
-        _log(logfile, f"UNLINK {p} ({why})")
-        out.append((p, "unlinked"))
+            out.append((p, "would quarantine")); continue
+        try:
+            dest = quarantine_path(p)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.rename(p, dest)
+        except (OSError, ValueError) as e:
+            _log(logfile, f"QUARANTINE FAILED {p}: {e}")
+            out.append((p, f"failed: {e}")); continue
+        _log(logfile, f"QUARANTINE {p} -> {dest} ({why})")
+        out.append((p, "quarantined"))
     return out
 
 
@@ -229,9 +256,9 @@ def qbit_tag(session, base_url: str, hash_: str, apply: bool, logfile: str = "",
     return "tagged" if r.ok else f"tag failed HTTP {r.status_code}"
 
 
-def qbit_delete(session, base_url: str, hash_: str, apply: bool, logfile: str = "", delete_files: bool = True) -> str:
+def qbit_delete(session, base_url: str, hash_: str, apply: bool, logfile: str = "", delete_files: bool = False) -> str:
     if not apply:
-        return "would delete torrent+files"
+        return "would delete torrent" + ("+files" if delete_files else " (files kept)")
     r = session.post(f"{base_url}/api/v2/torrents/delete",
                      data={"hashes": hash_, "deleteFiles": "true" if delete_files else "false"}, timeout=60)
     _log(logfile, f"QBIT-DELETE {hash_} deleteFiles={delete_files} -> HTTP {r.status_code}")
@@ -246,15 +273,18 @@ def execute(decision: Decision, session, base_url: str, apply: bool, logfile: st
         return [f"refused: {decision.reason}"]
     outcomes = unlink_raw(decision.unlink_raw, apply, logfile, why or decision.mode)
     res = [f"{o}: {p}" for p, o in outcomes]
-    if apply and any(o != "unlinked" for _, o in outcomes):
-        res.append("ABORT: a library name was not unlinked, so the torrent was left untouched")
+    if apply and any(o != "quarantined" for _, o in outcomes):
+        res.append("ABORT: a file could not be quarantined, so the torrent was left untouched")
         _log(logfile, f"ABORT {decision.torrent_hash}: unlink outcomes {outcomes}")
         return res
     for label, fn, wanted in (("tag", qbit_tag, decision.tag), ("delete", qbit_delete, decision.delete_torrent)):
         if not wanted:
             continue
         try:
-            res.append("qBit " + fn(session, base_url, decision.torrent_hash, apply, logfile))
+            if label == "delete":
+                res.append("qBit " + qbit_delete(session, base_url, decision.torrent_hash, apply, logfile, delete_files=decision.delete_files))
+            else:
+                res.append("qBit " + fn(session, base_url, decision.torrent_hash, apply, logfile))
         except Exception as e:  # noqa: BLE001 - the library name may already be unlinked; report, do not crash the run
             _log(logfile, f"QBIT-{label.upper()} {decision.torrent_hash} FAILED: {e}")
             res.append(f"qBit {label} FAILED ({type(e).__name__}); library names were already handled - check the torrent by hand")
@@ -263,7 +293,7 @@ def execute(decision: Decision, session, base_url: str, apply: bool, logfile: st
 
 def succeeded(lines: list) -> bool:
     """True only if every line of an execute() result is a success or a dry-run note."""
-    ok = ("unlinked:", "would", "qBit tagged", "qBit deleted", "qBit would")
+    ok = ("quarantined:", "would", "qBit tagged", "qBit deleted", "qBit would")
     return bool(lines) and all(l.startswith(ok) for l in lines)
 
 

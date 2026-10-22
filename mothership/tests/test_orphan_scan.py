@@ -88,6 +88,29 @@ class ApplyFlow(unittest.TestCase):
         rc, removed = self.run_main(on, known, {"q"}, {"a"}, ["--apply"], raw=lambda p: ["/mnt/disk1/x", "/mnt/disk2/x"])
         self.assertEqual(removed, [])
 
+    def test_per_run_limit_stops_a_runaway_deletion(self):
+        on = disk(*[f"k{i}.mkv" for i in range(12)], *[f"o{i}.mkv" for i in range(8)])
+        known = {p for p in on if "/k" in p}
+        with mock.patch.object(os_, "MAX_DELETE_FILES", 3):
+            rc, removed = self.run_main(on, known, {"q"}, {"a"}, ["--apply"])
+        self.assertEqual(len(removed), 3)
+
+    def test_a_torrent_added_during_the_scan_protects_its_file(self):
+        on = disk(*[f"k{i}.mkv" for i in range(9)], "late.mkv")
+        known = {p for p in on if "late" not in p}
+        calls = {"n": 0}
+        def qbit():
+            calls["n"] += 1
+            return {"q"} if calls["n"] == 1 else {"q", D + "late.mkv"}      # appears on the second look
+        with mock.patch.object(os_, "load_qbit_known", side_effect=qbit), mock.patch.object(os_, "load_plex_known", return_value=known), \
+                mock.patch.object(os_, "load_arr_known", return_value={"a"}), mock.patch.object(os_, "scan_disk", return_value=on), \
+                mock.patch.object(os_.safe_ops, "raw_copies", side_effect=lambda p: [p.replace("/mnt/user/", "/mnt/disk1/")]), mock.patch.object(os_.safe_ops, "file_identity", return_value=(1, 1, 1)), \
+                mock.patch.object(os_.safe_ops, "unlink_raw", side_effect=lambda paths, apply, *a: removed.extend(paths) or []), mock.patch.object(os_.safe_ops, "prune_empty_parents", return_value=[]), \
+                mock.patch.object(os_, "log"), mock.patch.object(sys, "argv", ["x", "--apply"]):
+            removed = []
+            os_.main()
+        self.assertEqual(removed, [])
+
     def test_dry_run_never_deletes(self):
         on = disk(*[f"k{i}.mkv" for i in range(9)], "orphan.mkv")
         known = {p for p in on if "orphan" not in p}

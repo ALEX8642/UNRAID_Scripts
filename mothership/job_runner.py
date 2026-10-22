@@ -30,13 +30,14 @@ import safe_ops
 from safe_ops import classify_removal, raw_copies
 
 JOBS = os.environ.get("JOBS_DIR", "/jobs")
-LOGFILE = "/logs/job-runner.log"
+LOGFILE = os.environ.get("JOB_LOG", "/logs/job-runner.log")
 MAX_AGE_S = 30 * 60
+MAX_FILES_PER_JOB = int(os.environ.get("JOB_MAX_FILES", "500"))
 KOMETA_DIR = os.environ.get("KOMETA_DIR", "/kometa")
 RADARR_URL, RADARR_KEY = os.environ.get("RADARR_URL", ""), os.environ.get("RADARR_KEY", "")
 SONARR_URL, SONARR_KEY = os.environ.get("SONARR_URL", ""), os.environ.get("SONARR_KEY", "")
 PLEX_URL, PLEX_TOKEN = os.environ.get("PLEX_URL", ""), os.environ.get("PLEX_TOKEN", "")
-LIB_ROOTS = ("/mnt/user/Media/Movies/", "/mnt/user/Media/tv/")
+LIB_ROOTS = (safe_ops.USER_PREFIX + "Media/Movies/", safe_ops.USER_PREFIX + "Media/tv/")
 
 
 def log(msg):
@@ -101,6 +102,8 @@ def run_delete(job, dr):
     dr.APPLY = bool(job["apply"])
     if not job.get("paths") or job.get("app") not in ("radarr", "sonarr") or not isinstance(job.get("arr_id"), int):
         return {"ok": False, "lines": ["malformed job: needs app, an integer arr_id and a non-empty list of paths"]}
+    if len(job["paths"]) > MAX_FILES_PER_JOB:
+        return {"ok": False, "lines": [f"{len(job['paths'])} files in one job exceeds the safety limit of {MAX_FILES_PER_JOB}; split it or raise JOB_MAX_FILES deliberately"]}
     try:
         tracked = arr_file_paths(job)
     except Exception as e:  # noqa: BLE001
@@ -204,7 +207,11 @@ def process(path, dr):
     os.replace(path, claimed)
     path = claimed
     if job.get("type") == "delete_files":
-        dr.load_qbit_index()       # fresh per job: a torrent added since the last job must be visible
+        try:
+            dr.load_qbit_index()       # fresh per job: a torrent added since the last job must be visible
+        except Exception as e:  # noqa: BLE001 - qBittorrent down mid-call: refuse and say so, do not crash the runner
+            dr.QBIT_SESSION = None
+            log(f"qBittorrent index failed for {os.path.basename(path)}: {e!r}")
         if dr.QBIT_SESSION is None or not dr.QBIT_TORRENTS or dr.QBIT_SKIPPED:
             job["result"] = {"ok": False, "lines": ["qBittorrent index unavailable or incomplete: refusing to delete anything"], "digest": ""}
             write_done(os.path.basename(path)[:-5], dict(job, finished=time.time()))

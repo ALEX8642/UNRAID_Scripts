@@ -7,18 +7,22 @@ against a live library — this file is what both tools import instead of each d
 themselves, so that specific failure mode can't recur.
 """
 
+import os
+
+MNT = os.environ.get("MOTHERSHIP_MNT", "/mnt")     # overridable only so tests can run against a scratch tree
+
 # Container-path -> host-path prefixes. Edit these for your setup.
 PATH_MAP = [
-    ("/movies/", "/mnt/user/Media/Movies/"),
-    ("/tv/", "/mnt/user/Media/tv/"),
-    ("/arr/movies/", "/mnt/user/Media/arr/movies/"),
-    ("/arr/shows/", "/mnt/user/Media/arr/shows/"),
+    ("/movies/", MNT + "/user/Media/Movies/"),
+    ("/tv/", MNT + "/user/Media/tv/"),
+    ("/arr/movies/", MNT + "/user/Media/arr/movies/"),
+    ("/arr/shows/", MNT + "/user/Media/arr/shows/"),
     # Radarr/Sonarr see everything through one /media mount (= /mnt/user/Media) since the 2026 migration;
     # this is what makes hardlinked imports work, and it is how they report their file paths.
-    ("/media/Movies/", "/mnt/user/Media/Movies/"),
-    ("/media/tv/", "/mnt/user/Media/tv/"),
-    ("/media/arr/movies/", "/mnt/user/Media/arr/movies/"),
-    ("/media/arr/shows/", "/mnt/user/Media/arr/shows/"),
+    ("/media/Movies/", MNT + "/user/Media/Movies/"),
+    ("/media/tv/", MNT + "/user/Media/tv/"),
+    ("/media/arr/movies/", MNT + "/user/Media/arr/movies/"),
+    ("/media/arr/shows/", MNT + "/user/Media/arr/shows/"),
 ]
 
 

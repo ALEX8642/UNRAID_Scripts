@@ -57,7 +57,7 @@ class Delete(unittest.TestCase):
         for x in self.p:
             x.start()
         self.executed = []
-        self.q = mock.patch.object(jr.safe_ops, "execute", side_effect=lambda d, *a, **k: self.executed.append(d.mode) or (["unlinked: x"] if d.unlink_raw else ["qBit tagged"] if d.tag else ["qBit deleted"]))
+        self.q = mock.patch.object(jr.safe_ops, "execute", side_effect=lambda d, *a, **k: self.executed.append(d.mode) or (["quarantined: x"] if d.unlink_raw else ["qBit tagged"] if d.tag else ["qBit deleted"]))
         self.q.start()
         self.pr = mock.patch.object(jr.safe_ops, "prune_empty_parents", return_value=[])
         self.pr.start()
@@ -123,6 +123,11 @@ class Delete(unittest.TestCase):
             res = jr.run_delete(job(apply=True, plan_digest=d, **changed), FakeDR())
             self.assertFalse(res["ok"], changed)
         self.assertEqual(self.executed, []); self.requests.delete.assert_not_called()
+
+    def test_oversized_jobs_are_refused(self):
+        with mock.patch.object(jr, "MAX_FILES_PER_JOB", 2):
+            res = jr.run_delete(job(paths=[P1, P1 + "2", P1 + "3"]), FakeDR())
+        self.assertFalse(res["ok"]); self.assertIn("safety limit", res["lines"][0])
 
     def test_empty_or_malformed_jobs_are_refused(self):
         for bad in (dict(paths=[]), dict(arr_id="7"), dict(app="plex")):

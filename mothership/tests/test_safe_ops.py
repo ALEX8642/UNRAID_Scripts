@@ -83,7 +83,8 @@ class ClassifyTests(unittest.TestCase):
 
     def test_own_name_seasoned_goes_through_qbit_not_unlink(self):
         d = classify_removal(self.RAW, self.T(seed_days=100))
-        self.assertEqual(d.mode, "QBIT_DELETE"); self.assertTrue(d.delete_torrent); self.assertFalse(d.unlink_raw)
+        # the file is quarantined first; qBittorrent then forgets the torrent WITHOUT deleting files
+        self.assertEqual(d.mode, "QBIT_DELETE"); self.assertTrue(d.delete_torrent); self.assertFalse(d.delete_files); self.assertEqual(d.unlink_raw, self.RAW)
 
     def test_own_name_young_is_tag_only_and_touches_no_file(self):
         d = classify_removal(self.RAW, self.T(seed_days=3))
@@ -104,7 +105,7 @@ class ClassifyTests(unittest.TestCase):
 
 class ExecuteTests(unittest.TestCase):
     def setUp(self):
-        self.d = tempfile.mkdtemp(); self.f = os.path.join(self.d, "a.mkv")
+        self.d = tempfile.mkdtemp(); os.makedirs(os.path.join(self.d, "Media", "Movies")); self.f = os.path.join(self.d, "Media", "Movies", "a.mkv")
         with open(self.f, "w") as fh: fh.write("x")
 
     def test_dry_run_changes_nothing_and_calls_nothing(self):
@@ -121,8 +122,9 @@ class ExecuteTests(unittest.TestCase):
         dec = classify_removal([self.f], TorrentInfo("h", "n", 100, covers_exact_path=False))
         execute(dec, s, "http://q", apply=True)
         self.assertFalse(os.path.exists(self.f))
-        self.assertEqual(events, [("api", False, "delete")])   # file already gone when the torrent is deleted
-        self.assertEqual(s.calls[0][1]["deleteFiles"], "true")
+        self.assertEqual(events, [("api", False, "delete")])   # file already moved away when the torrent is deleted
+        self.assertEqual(s.calls[0][1]["deleteFiles"], "true")  # a hardlinked seed: the data is still held by the quarantined name
+        self.assertTrue(any(f == "a.mkv" for _r, _d, fs in os.walk(os.path.join(self.d, "Media", ".quarantine")) for f in fs))
 
     def test_tag_only_never_deletes_files(self):
         s = FakeSession(); dec = classify_removal([self.f], TorrentInfo("h", "n", 2))
@@ -151,9 +153,9 @@ class SecondRoundTests(unittest.TestCase):
         self.assertTrue(any(o.startswith("ABORT") for o in out)); self.assertFalse(so.succeeded(out))
 
     def test_succeeded_requires_every_line_to_be_a_success(self):
-        self.assertTrue(so.succeeded(["unlinked: /x", "qBit deleted"]))
+        self.assertTrue(so.succeeded(["quarantined: /x", "qBit deleted"]))
         self.assertTrue(so.succeeded(["would unlink: /x", "qBit would delete torrent+files"]))
-        self.assertFalse(so.succeeded(["unlinked: /x", "qBit delete failed HTTP 500"]))
+        self.assertFalse(so.succeeded(["quarantined: /x", "qBit delete failed HTTP 500"]))
         self.assertFalse(so.succeeded(["missing: /x"])); self.assertFalse(so.succeeded([]))
 
     def test_shared_torrent_files_are_never_deleted(self):
@@ -188,6 +190,47 @@ class SecondRoundTests(unittest.TestCase):
         self.assertTrue(so.seed_rule_met(dict(t(), completion_on=now - 20 * 86400, state="pausedUP"), now))
 
 
+class QuarantineTests(unittest.TestCase):
+    def tree(self):
+        d = tempfile.mkdtemp(); os.makedirs(f"{d}/disk1/Media/Movies/A (2020)"); f = f"{d}/disk1/Media/Movies/A (2020)/a.mkv"
+        with open(f, "w") as fh: fh.write("data")
+        return d, f
+
+    def test_removal_is_a_same_disk_rename_into_dated_quarantine(self):
+        d, f = self.tree()
+        out = so.unlink_raw([f], True)
+        self.assertEqual(out[0][1], "quarantined"); self.assertFalse(os.path.exists(f))
+        q = so.quarantine_path(f.replace("a.mkv", "zz.mkv"), "2026-10-22")
+        self.assertIn("/disk1/Media/.quarantine/2026-10-22/Movies/A (2020)/", q)
+        found = [os.path.join(r, n) for r, _d, fs in os.walk(f"{d}/disk1/Media/.quarantine") for n in fs]
+        self.assertEqual(len(found), 1); self.assertEqual(open(found[0]).read(), "data")           # the bytes are intact and recoverable
+        self.assertEqual(os.stat(found[0]).st_dev, os.stat(f"{d}/disk1/Media").st_dev)             # same device: a rename, no copy
+
+    def test_name_collisions_never_overwrite_earlier_quarantine(self):
+        d, f = self.tree()
+        so.unlink_raw([f], True)
+        with open(f, "w") as fh: fh.write("second")
+        so.unlink_raw([f], True)
+        found = sorted(os.path.join(r, n) for r, _d, fs in os.walk(f"{d}/disk1/Media/.quarantine") for n in fs)
+        self.assertEqual(sorted(open(x).read() for x in found), ["data", "second"])
+
+    def test_dry_run_moves_nothing(self):
+        d, f = self.tree()
+        self.assertEqual(so.unlink_raw([f], False)[0][1], "would quarantine"); self.assertTrue(os.path.exists(f))
+
+    def test_files_outside_media_or_already_quarantined_are_refused(self):
+        d = tempfile.mkdtemp(); f = os.path.join(d, "x.mkv"); open(f, "w").close()
+        self.assertTrue(so.unlink_raw([f], True)[0][1].startswith("failed")); self.assertTrue(os.path.exists(f))
+        with self.assertRaises(ValueError):
+            so.quarantine_path("/mnt/disk1/Media/.quarantine/2026-10-22/Movies/a.mkv")
+
+    def test_library_seed_deletion_keeps_files_unless_data_is_reachable_elsewhere(self):
+        young_exact = classify_removal(["/mnt/disk1/Media/Movies/A/a.mkv"], TorrentInfo("h", "n", 100, covers_exact_path=True))
+        self.assertFalse(young_exact.delete_files)
+        arr_seed = classify_removal(["/mnt/disk1/Media/Movies/A/a.mkv"], TorrentInfo("h", "n", 100, covers_exact_path=False))
+        self.assertTrue(arr_seed.delete_files)           # only because the quarantined library name still holds the bytes
+
+
 class HardeningTests(unittest.TestCase):
     def test_raw_copies_refuses_path_traversal(self):
         with tempfile.TemporaryDirectory() as d:
@@ -209,7 +252,7 @@ class HardeningTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(f"{d}/disk1/Media/Movies")); self.assertTrue(os.path.isdir(f"{d}/disk1/Media"))
 
     def test_qbit_failure_after_unlink_is_reported_not_raised(self):
-        d = tempfile.mkdtemp(); f = os.path.join(d, "a.mkv"); open(f, "w").close()
+        d = tempfile.mkdtemp(); os.makedirs(os.path.join(d, "Media", "Movies")); f = os.path.join(d, "Media", "Movies", "a.mkv"); open(f, "w").close()
         class Boom:
             def post(self, *a, **k): raise ConnectionError("qbit down")
         dec = classify_removal([f], TorrentInfo("h", "n", 100, covers_exact_path=False))
@@ -223,7 +266,7 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(out[sub], "missing"); self.assertTrue(os.path.isdir(sub))
 
     def test_unlink_only_removes_the_name_not_other_hardlinks(self):
-        d = tempfile.mkdtemp(); a = os.path.join(d, "a.mkv"); b = os.path.join(d, "b.mkv")
+        d = tempfile.mkdtemp(); os.makedirs(os.path.join(d, "Media", "Movies")); a = os.path.join(d, "Media", "Movies", "a.mkv"); b = os.path.join(d, "b.mkv")
         
         with open(a, "w") as fh: fh.write("data")
         os.link(a, b)
