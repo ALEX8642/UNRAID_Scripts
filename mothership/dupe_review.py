@@ -378,6 +378,11 @@ QBIT_SKIPPED = 0     # torrents whose location could not be indexed; while this 
 NON_LIBRARY_ROOTS = tuple(r for r in os.environ.get("NON_LIBRARY_ROOTS", "/music,/musicvideos,/stash,/VR,/software,/downloads/incomplete,/run").split(",") if r)
 
 
+def _under(path: str, roots) -> bool:
+    """Path-boundary match: '/run' covers '/run/x' but not '/runway-movies/x'."""
+    return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
 def load_qbit_index() -> dict:
     """host path (file or folder) -> torrent hash, for every torrent's content_path."""
     global QBIT_SESSION, QBIT_TORRENTS, QBIT_SKIPPED
@@ -405,7 +410,7 @@ def load_qbit_index() -> dict:
                 # something to guess about, so don't let it participate in the match.
                 # A LIST of hashes: the same release cross-seeded to two trackers must not collapse to whichever came last.
                 index.setdefault(host_path, []).append(h)
-            elif not cp.startswith(NON_LIBRARY_ROOTS):
+            elif not _under(cp, NON_LIBRARY_ROOTS):
                 QBIT_SKIPPED += 1      # an unknown mount that is not a known non-library root: its files would look unseeded
             continue
         # content_path is exactly a bare category root ("/tv", "/movies", ...). This could be
@@ -421,7 +426,7 @@ def load_qbit_index() -> dict:
         # folder string would.
         save_path, mapped = to_host_path((t.get("save_path", "") or "").rstrip("/"))
         if not mapped:
-            if not save_path.startswith(NON_LIBRARY_ROOTS):
+            if not _under(save_path, NON_LIBRARY_ROOTS):
                 QBIT_SKIPPED += 1
             continue
         rr = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
@@ -901,8 +906,9 @@ PLAN: list = []
 def qbit_n_files(h: str) -> int:
     try:
         r = QBIT_SESSION.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": h}, timeout=30)
-        n = len(r.json())
-        return n if n >= 1 else 999     # an empty answer is "unknown", never "zero files, so not a pack"
+        body = r.json()
+        n = len(body) if r.ok and isinstance(body, list) else 0
+        return n if n >= 1 else 999     # an empty/error answer is "unknown", never "zero files, so not a pack"
     except Exception:
         return 999          # unknown -> treated as a pack -> refused
 
@@ -917,6 +923,8 @@ def torrent_for(rec) -> Optional[TorrentInfo]:
     exact = True
     if not hs and len(rec.raw) == 1 and rec.nlink > 1:
         for n in safe_ops.other_names(rec.raw[0]):
+            if "/Media/" not in n:
+                continue
             host = safe_ops.USER_PREFIX + "Media/" + n.split("/Media/", 1)[1]
             hs = torrent_hashes_for(host, QBIT_INDEX)
             if hs:
@@ -987,8 +995,12 @@ def delete_one(rec: FileRecord, to_keep: list, use_trash: bool, run_stamp: str) 
         if ans != "y":
             console.print("    [yellow]Skipped.[/yellow]")
             return "declined"
-    for line in safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"dupe-review keep={[k.path for k in to_keep]}"):
+    lines = safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"dupe-review keep={[k.path for k in to_keep]}")
+    for line in lines:
         console.print(f"      {line}")
+    if APPLY and not safe_ops.succeeded(lines):
+        console.print("    [red]The removal did not complete; nothing is marked as reviewed and the arr is not changed.[/red]")
+        return "error"
     removed = bool(dec.unlink_raw or dec.delete_torrent)
     if APPLY and removed:
         _removals["n"] += 1
@@ -1042,8 +1054,12 @@ def execute_plan(path: str) -> None:
             console.print(f"  [yellow]SKIP {a['title']}: the file's size changed since planning[/yellow]")
             continue
         console.print(f"  [bold]{a['title']}[/bold]: {dec.mode}")
-        for line in safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"plan {os.path.basename(path)}"):
+        lines = safe_ops.execute(dec, QBIT_SESSION, QBIT_URL, apply=APPLY, logfile=LOGFILE, why=f"plan {os.path.basename(path)}")
+        for line in lines:
             console.print(f"      {line}")
+        if APPLY and not safe_ops.succeeded(lines):
+            console.print("  [red]The removal did not complete: not reconciling Radarr/Sonarr and not counting it as done.[/red]")
+            continue
         if a.get("arr") in ("Radarr", "Sonarr") and len(a["keep"]) == 1 and (dec.unlink_raw or dec.delete_torrent):
             reconcile_arr(SimpleNamespace(path=a["keep"][0]), SimpleNamespace(group_kind=a["kind"], arr_id=a["arr_id"], tracked_by=a["arr"]))
         done += 1

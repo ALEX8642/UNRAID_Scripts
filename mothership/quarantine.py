@@ -28,7 +28,16 @@ def days(root):
     q = os.path.join(root, "Media", ".quarantine")
     if not os.path.isdir(q):
         return []
-    return sorted(d for d in os.listdir(q) if DAY.match(d) and os.path.isdir(os.path.join(q, d)))
+    ok = []
+    for d in os.listdir(q):
+        if not (DAY.match(d) and os.path.isdir(os.path.join(q, d))):
+            continue
+        try:
+            datetime.date.fromisoformat(d)      # 2026-13-45 matches the pattern but is not a date: never touch it
+        except ValueError:
+            continue
+        ok.append(d)
+    return sorted(ok)
 
 
 def size_of(path):
@@ -50,7 +59,11 @@ def listing():
             for r, _dn, fs in os.walk(base):
                 for f in fs:
                     p = os.path.join(r, f)
-                    out.append({"root": root, "day": d, "rel": os.path.relpath(p, base), "size": os.path.getsize(p), "path": p})
+                    try:
+                        sz = os.path.getsize(p)
+                    except OSError:
+                        sz = 0                  # a dangling symlink must not break the listing
+                    out.append({"root": root, "day": d, "rel": os.path.relpath(p, base), "size": sz, "path": p})
     return sorted(out, key=lambda x: (x["day"], x["rel"]), reverse=True)
 
 
@@ -96,6 +109,8 @@ def main(argv):
             print(f"{e['day']}  {e['size'] / 1e9:8.2f} GB  {e['root']}  {e['rel']}")
     elif cmd == "purge":
         n = int(argv[argv.index("--days") + 1]) if "--days" in argv else 7
+        if n < 1:
+            raise SystemExit("--days must be at least 1: today's quarantine is never purged")
         gone, freed = purge(n, apply)
         print(f"{'PURGED' if apply else 'WOULD PURGE'} {len(gone)} day folder(s) older than {n} days, {freed / 1e9:.1f} GB")
     elif cmd == "restore":

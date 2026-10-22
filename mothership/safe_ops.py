@@ -20,6 +20,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -45,6 +46,7 @@ MAX_TORRENT_FILES = 3
 MNT = os.environ.get("MOTHERSHIP_MNT", "/mnt")
 DISK_GLOB = os.environ.get("MOTHERSHIP_DISK_GLOB", MNT + "/disk[0-9]*")
 USER_PREFIX = MNT + "/user/"
+FUSE_VIEWS = ("user", "user0", "disks", "remotes", "rootshare")      # never modify files through any of these
 
 
 def raw_copies(host_path: str, disk_glob: Optional[str] = None) -> list:
@@ -81,10 +83,10 @@ def other_names(raw_path: str, subdirs=("Media/arr",)) -> list:
     for sub in subdirs:
         d = os.path.join(root, sub)
         if os.path.isdir(d):
-            r = subprocess.run(["find", d, "-xdev", "-type", "f", "-inum", str(st.st_ino)], capture_output=True, text=True)
+            r = subprocess.run(["find", d, "-xdev", "-type", "f", "-inum", str(st.st_ino), "-print0"], capture_output=True, text=True)
             if r.returncode != 0:
                 raise RuntimeError(f"hardlink search failed in {d}: {r.stderr.strip()[:120]}")
-            found += [l for l in r.stdout.splitlines() if l and l != raw_path]
+            found += [l for l in r.stdout.split("\0") if l and l != raw_path]      # NUL-separated: a newline in a name must not split it
     return found
 
 
@@ -168,7 +170,7 @@ def classify_removal(raw_paths: list, torrent: Optional[TorrentInfo], keeper_raw
     if not torrent.covers_exact_path:
         return Decision("LIBRARY_NAME_THEN_DELETE" if seasoned else "LIBRARY_NAME_THEN_TAG",
                         MODES["LIBRARY_NAME_THEN_DELETE" if seasoned else "LIBRARY_NAME_THEN_TAG"],
-                        unlink_raw=list(raw_paths), delete_torrent=seasoned, delete_files=seasoned, tag=not seasoned, **base)
+                        unlink_raw=list(raw_paths), delete_torrent=seasoned, delete_files=(seasoned and torrent.n_files == 1), tag=not seasoned, **base)   # only a single-file seed: its one file is the quarantined name; other files exist nowhere else
     if seasoned:
         return Decision("QBIT_DELETE", MODES["QBIT_DELETE"], unlink_raw=list(raw_paths), delete_torrent=True, delete_files=False, **base)
     return Decision("TAG_ONLY", MODES["TAG_ONLY"], tag=True, **base)
@@ -207,7 +209,7 @@ def unlink_raw(paths: list, apply: bool, logfile: str = "", why: str = "") -> li
     reversible until quarantine_purge.py empties it). Never touches /mnt/user paths. Returns [(path, outcome)]."""
     out = []
     for p in paths:
-        if p.startswith(USER_PREFIX):
+        if p.startswith(USER_PREFIX) or any(p == f"{MNT}/{v}" or p.startswith(f"{MNT}/{v}/") for v in FUSE_VIEWS) or re.search(r"/(user|user0)/Media/", p):
             out.append((p, "refused: FUSE path")); continue
         if os.path.islink(p) or not os.path.isfile(p):
             out.append((p, "missing")); continue
