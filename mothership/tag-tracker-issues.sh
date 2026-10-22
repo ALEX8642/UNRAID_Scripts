@@ -62,16 +62,22 @@ log() {
 }
 
 COOKIE=$(mktemp)
-login_http=$(curl -s -o /dev/null -w '%{http_code}' -c "$COOKIE" -d "username=$QBIT_USER&password=$QBIT_PASS" "$QBIT_URL/api/v2/auth/login")
-if [ "$login_http" != "200" ]; then
-  log "FATAL: qBittorrent login failed (HTTP $login_http)."
+login_body=$(curl -s -w '\n%{http_code}' -c "$COOKIE" -d "username=$QBIT_USER&password=$QBIT_PASS" "$QBIT_URL/api/v2/auth/login")
+login_http=${login_body##*$'\n'}
+if [ "$login_http" != "200" ] || [ "$(head -n1 <<< "$login_body")" != "Ok." ]; then
+  log "FATAL: qBittorrent login failed (HTTP $login_http; a 200 with a body other than 'Ok.' is a refused login)."
   rm -f "$COOKIE"
   exit 1
 fi
 
 log "=== tag-tracker-issues run started $( [ "$DRY_RUN" -eq 1 ] && echo '(DRY RUN — nothing will be tagged)' || echo '(APPLY MODE)' ) ==="
 
-HASHES=$(curl -s -b "$COOKIE" "$QBIT_URL/api/v2/torrents/info" | jq -r '.[].hash')
+INFO=$(curl -s -b "$COOKIE" "$QBIT_URL/api/v2/torrents/info")
+if ! jq -e 'type=="array" and length>0' <<< "$INFO" >/dev/null 2>&1; then
+  log "FATAL: qBittorrent returned no usable torrent list. Changing no tags."
+  rm -f "$COOKIE"; exit 1
+fi
+HASHES=$(jq -r '.[].hash' <<< "$INFO")
 total=$(echo "$HASHES" | wc -l)
 log "Checking $total torrents..."
 
@@ -80,6 +86,7 @@ log "Checking $total torrents..."
 : > "$WORKDIR/tracker-missing.txt"
 : > "$WORKDIR/tracker-auth.txt"
 : > "$WORKDIR/tracker-issue.txt"
+: > "$WORKDIR/failed.txt"      # torrents whose tracker query failed: their tags are left exactly as they are
 
 checked=0
 for h in $HASHES; do
@@ -87,9 +94,12 @@ for h in $HASHES; do
   (( checked % 500 == 0 )) && log "... checked $checked/$total so far"
 
   # One torrent can have multiple trackers; take the first real status-4 message found.
-  msg=$(curl -s -b "$COOKIE" "$QBIT_URL/api/v2/torrents/trackers?hash=$h" \
-    | jq -r '.[] | select(.url | test("^http")) | select(.status==4) | .msg' \
-    | grep -v '^$' | head -1)
+  tr_body=$(curl -s -w '\n%{http_code}' -b "$COOKIE" "$QBIT_URL/api/v2/torrents/trackers?hash=$h")
+  tr_http=${tr_body##*$'\n'}; tr_json=${tr_body%$'\n'*}
+  if [ "$tr_http" != "200" ] || ! jq -e 'type=="array"' <<< "$tr_json" >/dev/null 2>&1; then
+    echo "$h" >> "$WORKDIR/failed.txt"; continue          # unknown is not "fine": never infer anything from a failed query
+  fi
+  msg=$(jq -r '.[] | select(.url | test("^http")) | select(.status==4) | .msg' <<< "$tr_json" | grep -v '^$' | head -1)
 
   [ -z "$msg" ] && continue
 
@@ -102,6 +112,16 @@ for h in $HASHES; do
     *)                                    echo "$h" >> "$WORKDIR/tracker-issue.txt" ;;
   esac
 done
+
+failed=$(grep -c . "$WORKDIR/failed.txt" || true)
+if [ "${failed:-0}" -gt 0 ]; then
+  log "WARNING: $failed tracker query(ies) failed; those torrents keep their current tags."
+  if [ $((failed * 20)) -gt "$total" ]; then
+    log "FATAL: more than 5% of tracker queries failed (qBittorrent restarting or the session expired). Changing no tags."
+    rm -f "$COOKIE"; exit 1
+  fi
+fi
+sort -o "$WORKDIR/failed.txt" "$WORKDIR/failed.txt"
 
 # Syncs one tag to exactly the torrents in $file: adds it to any that don't have it yet,
 # removes it from any that currently have it but no longer belong (problem resolved). This is
@@ -117,7 +137,7 @@ sync_tag() {
 
   local to_add to_remove add_count remove_count
   to_add=$(comm -13 "$current_file" "$file")
-  to_remove=$(comm -23 "$current_file" "$file")
+  to_remove=$(comm -23 "$current_file" "$file" | comm -23 - "$WORKDIR/failed.txt")
   add_count=$(grep -c . <<< "$to_add" || true)
   remove_count=$(grep -c . <<< "$to_remove" || true)
   [ -z "$to_add" ] && add_count=0

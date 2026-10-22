@@ -16,17 +16,17 @@
 # script attempts).
 #
 # Safety model, in order, for every duplicate found:
-#   1. Full SHA-256 checksum of both copies — must match exactly, or skip (not a simple dupe).
+#   1. Equal size AND a full byte-for-byte comparison (cmp) of both copies — must match exactly, or skip (not a simple dupe).
 #   2. Determine which copy /mnt/user currently exposes by matching ctime exactly against both
 #      physical copies. If ctime doesn't uniquely identify one side, skip — guessing wrong
 #      deletes the copy everything (Plex, Sonarr, qBittorrent) actually depends on.
-#   3. Only ever delete the NON-exposed physical copy, directly via its /mnt/diskN path — never
+#   3. Only ever quarantine (move, not delete) the NON-exposed physical copy, directly via its /mnt/diskN path — never
 #      through /mnt/user, whose hardlink/rm behavior for cross-disk cases is not well
 #      understood and produced an unexplained result during testing.
 #   4. A path found on 3+ disks is skipped and reported — this script only auto-resolves the
 #      simple two-copy case.
 #
-# Defaults to DRY RUN (report only, deletes nothing). Pass --apply to actually delete.
+# Defaults to DRY RUN (report only). Pass --apply to move the redundant copy into <disk>/Media/.quarantine/<date>/ (purged after 7 days).
 
 set -uo pipefail
 
@@ -214,10 +214,9 @@ while IFS=$'\t' read -r count diskcsv sizecsv relpath; do
     continue
   fi
 
-  hash_a=$(partial_hash "$path_a")
-  hash_b=$(partial_hash "$path_b")
-  if [ "$hash_a" != "$hash_b" ]; then
-    log "SKIP (partial-hash mismatch — NOT a simple duplicate, needs manual review): $relpath"
+  # a full byte-for-byte comparison: head/tail hashing cannot see corruption in the middle, and the copy we keep might be the damaged one
+  if ! cmp -s -- "$path_a" "$path_b"; then
+    log "SKIP (content differs — NOT a simple duplicate, needs manual review): $relpath"
     skipped_checksum=$((skipped_checksum + 1))
     continue
   fi
@@ -244,14 +243,22 @@ while IFS=$'\t' read -r count diskcsv sizecsv relpath; do
 
   size=$(stat -c '%s' "$redundant")
   if [ "$DRY_RUN" -eq 1 ]; then
-    log "WOULD DELETE (redundant physical copy, not exposed via /mnt/user): $redundant  (keeping: $exposed)"
+    log "WOULD QUARANTINE (redundant physical copy, not exposed via /mnt/user): $redundant  (keeping: $exposed)"
   else
-    rm -f -- "$redundant"
-    log "DELETED (redundant physical copy): $redundant  (kept: $exposed)"
-    # Verify /mnt/user is unaffected by this deletion.
+    # same disk, same convention as the other tools: a dated .quarantine folder, purged after a week; nothing is deleted here
+    rdisk=${redundant#"$MNT"/}; rdisk=${rdisk%%/*}
+    qdest="$MNT/$rdisk/Media/.quarantine/$(date +%F)/${relpath#Media/}"
+    if mkdir -p -- "$(dirname -- "$qdest")" && mv -n -- "$redundant" "$qdest" && [ ! -e "$redundant" ] && [ -e "$qdest" ]; then
+      log "QUARANTINED (redundant physical copy): $redundant -> $qdest  (kept: $exposed)"
+    else
+      log "FAILED to quarantine $redundant; nothing was changed for this file."
+      skipped_ambiguous=$((skipped_ambiguous + 1))
+      continue
+    fi
+    # Verify /mnt/user is unaffected by this change.
     ctime_user_after=$(stat -c '%Z' "$muser_path" 2>/dev/null || echo "MISSING")
     if [ "$ctime_user_after" != "$ctime_user" ]; then
-      log "WARNING: /mnt/user ctime changed after deleting the redundant copy for: $relpath — verify manually."
+      log "WARNING: /mnt/user ctime changed after quarantining the redundant copy for: $relpath — verify manually."
     fi
   fi
   resolved=$((resolved + 1))

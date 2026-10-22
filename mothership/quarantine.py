@@ -30,7 +30,7 @@ def days(root):
         return []
     ok = []
     for d in os.listdir(q):
-        if not (DAY.match(d) and os.path.isdir(os.path.join(q, d))):
+        if not (DAY.match(d) and os.path.isdir(os.path.join(q, d)) and not os.path.islink(os.path.join(q, d))):
             continue
         try:
             datetime.date.fromisoformat(d)      # 2026-13-45 matches the pattern but is not a date: never touch it
@@ -69,18 +69,27 @@ def listing():
 
 def purge(older_than_days, apply, today=None):
     today = today or datetime.date.today()
-    freed, gone = 0, []
+    freed, gone, failed = 0, [], []
     for root in roots():
         for d in days(root):
             age = (today - datetime.date.fromisoformat(d)).days
-            if age < older_than_days:
+            if age <= older_than_days:      # a full N days: a folder dated N days ago may be only N-1 days + minutes old
                 continue
             p = os.path.join(root, "Media", ".quarantine", d)
             assert os.path.basename(os.path.dirname(p)) == ".quarantine" and DAY.match(os.path.basename(p))     # never anything but a dated day folder
-            freed += size_of(p)
-            gone.append(p)
             if apply:
-                shutil.rmtree(p)
+                try:
+                    sz = size_of(p)
+                    shutil.rmtree(p)
+                except OSError as e:
+                    print(f"FAILED to purge {p}: {e}")
+                    failed.append(p)
+                    continue
+                freed += sz
+            else:
+                freed += size_of(p)
+            gone.append(p)
+    purge.failed = failed
     return gone, freed
 
 
@@ -113,6 +122,8 @@ def main(argv):
             raise SystemExit("--days must be at least 1: today's quarantine is never purged")
         gone, freed = purge(n, apply)
         print(f"{'PURGED' if apply else 'WOULD PURGE'} {len(gone)} day folder(s) older than {n} days, {freed / 1e9:.1f} GB")
+        if getattr(purge, "failed", None):
+            raise SystemExit(f"{len(purge.failed)} day folder(s) could not be purged")
     elif cmd == "restore":
         restore(argv[2], apply)
     else:

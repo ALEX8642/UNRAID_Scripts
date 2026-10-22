@@ -35,9 +35,10 @@ SONARR_KEY = os.environ.get("SONARR_KEY", "")
 QBIT_URL = os.environ.get("QBIT_URL", "http://localhost:8080")
 QBIT_USER = os.environ.get("QBIT_USER", "admin")
 QBIT_PASS = os.environ.get("QBIT_PASS", "")
-HNR_DAYS = float(os.environ.get("HNR_MIN_SEED_DAYS", "5"))
+HNR_DAYS = max(float(os.environ.get("HNR_MIN_SEED_DAYS", "5")), safe_ops.BHD_RULE_DAYS)  # BHD: 120 h OR ratio 1.0; a typo of 0 must never lower it
 MAX_PER_RUN = int(os.environ.get("SEED_CLEANUP_MAX", "5"))
 STRIKE_HOURS = 20
+MAX_HISTORY_PAGES = 100
 STATE = "/logs/seed_cleanup_state.json"
 # qBittorrent container path prefix -> folder under Media on the array
 PATH_MAP = {"/movies": "Media/Movies", "/tv": "Media/tv", "/arr": "Media/arr"}
@@ -77,21 +78,28 @@ def _ts(s):
 def upgrade_deleted_names(app):
     """{base name: EARLIEST epoch} of files the app deleted because of an Upgrade."""
     url, key = (RADARR_URL, RADARR_KEY) if app == "radarr" else (SONARR_URL, SONARR_KEY)
-    names, page = {}, 1
-    while page <= 20:
+    names, page, read, total = {}, 1, 0, 0
+    while page <= MAX_HISTORY_PAGES:
         r = requests.get(f"{url}/api/v3/history", params={"page": page, "pageSize": 500, "eventType": 6 if app == "radarr" else 5,
                                                           "sortKey": "date", "sortDirection": "descending"},
                          headers={"X-Api-Key": key}, timeout=120)
         r.raise_for_status()
-        recs = r.json().get("records", [])
+        body = r.json()
+        recs = body.get("records", [])
+        total = body.get("totalRecords", 0) or 0
         if not recs:
             break
+        read += len(recs)
         for h in recs:
             if (h.get("data") or {}).get("reason", "").lower() == "upgrade":
                 n = os.path.basename(h.get("sourceTitle", ""))
                 t = _ts(h.get("date", ""))
                 names[n] = min(names.get(n, t), t)
         page += 1
+        if total and read >= total:
+            break
+    if total and read < total:
+        raise RuntimeError(f"{app} history truncated: read {read} of {total} records (limit {MAX_HISTORY_PAGES} pages); refusing to treat the rest as 'no record'")
     return names
 
 
@@ -108,7 +116,8 @@ def content_present(q, t):
     sp = t.get("save_path", "").rstrip("/")
     if not files:
         return exists_on_array(t["content_path"])
-    big = [f for f in sorted(files, key=lambda f: -f["size"])[:3] if f["size"] > 50 * 1024 * 1024] or files[:1]  # the video(s); leftover .nfo/.jpg do not count as content
+    # every large file counts (a pack whose biggest episodes were upgraded away still seeds the rest); small .nfo/.jpg leftovers do not
+    big = [f for f in files if f["size"] > 50 * 1024 * 1024] or sorted(files, key=lambda f: -f["size"])[:1]
     return any(exists_on_array(f"{sp}/{f['name']}") for f in big)
 
 
@@ -156,7 +165,7 @@ def main():
     now = time.time()
     state = load_state()
     disks = mounted_disks()
-    if disks and state.get("_disks") and disks < state["_disks"]:
+    if state.get("_disks") and disks < state["_disks"]:
         sys.exit(f"only {disks} data disks are mounted but {state['_disks']} were seen before: a missing disk would make its files look deleted. Refusing.")
     missing = [t for t in torrents if t["state"] == "missingFiles"]
     print(f"torrents in missingFiles: {len(missing)}")
@@ -196,8 +205,15 @@ def main():
     if apply:
         save_state({**new_seen, "_disks": max(disks, state.get("_disks", 0))})      # persist BEFORE deleting anything
     for t in cands:
-        print(f"{'REMOVED' if apply else 'WOULD REMOVE'} {t['name'][:90]} (upgrade deleted its data)")
-        if apply:
+        if not apply:
+            print(f"WOULD REMOVE {t['name'][:90]} (upgrade deleted its data)")
+        else:
+            cur = [x for x in q.get(f"{QBIT_URL}/api/v2/torrents/info", params={"hashes": t["hash"]}, timeout=60).json() if x.get("hash") == t["hash"]]
+            if not cur or cur[0].get("state") != "missingFiles" or content_present(q, cur[0]):
+                print(f"SKIPPED {t['name'][:90]}: its state or content changed since the scan; leaving it alone")
+                new_seen.pop(t["hash"], None)
+                continue
+            print(f"REMOVED {t['name'][:90]} (upgrade deleted its data)")
             q.post(f"{QBIT_URL}/api/v2/torrents/delete", data={"hashes": t["hash"], "deleteFiles": "false"}, timeout=60).raise_for_status()
             new_seen.pop(t["hash"], None)
     if apply and cands:

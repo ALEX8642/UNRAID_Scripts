@@ -23,7 +23,7 @@ class Run:
         os.makedirs(self.mnt)
 
     def go(self, *args):
-        env = dict(os.environ, MNT=self.mnt, WORKDIR=os.path.join(self.d, "work"), LOGFILE=os.path.join(self.d, "log.txt"),
+        env = dict(os.environ, MNT=self.mnt, WORKDIR=os.path.join(self.d, "work"), LOGFILE=os.path.join(self.d, "log.txt"), LOCKFILE=os.path.join(self.d, "lock"),
                    QBIT_PASS="x", QBIT_URL="http://127.0.0.1:1")
         p = subprocess.run(["bash", SCRIPT, *args], env=env, capture_output=True, text=True, timeout=120)
         return p.stdout + p.stderr
@@ -55,13 +55,13 @@ class DedupeTests(unittest.TestCase):
     def test_dry_run_deletes_nothing(self):
         two_copies(self.r)
         out = self.r.go()
-        self.assertIn("WOULD DELETE", out)
+        self.assertIn("WOULD QUARANTINE", out)
         self.assertTrue(os.path.exists(self.r.p("disk1", REL)) and os.path.exists(self.r.p("disk2", REL)))
 
     def test_apply_deletes_only_the_copy_user_share_does_not_expose(self):
         two_copies(self.r, expose="disk1")
         out = self.r.go("--apply")
-        self.assertIn("DELETED", out)
+        self.assertIn("QUARANTINED", out)
         self.assertTrue(os.path.exists(self.r.p("disk1", REL)))
         self.assertFalse(os.path.exists(self.r.p("disk2", REL)))
         self.assertTrue(os.path.exists(self.r.p("user", REL)))

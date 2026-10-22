@@ -51,7 +51,7 @@ class ApplyFlow(unittest.TestCase):
         with mock.patch.object(os_, "load_qbit_known", return_value=qbit), mock.patch.object(os_, "load_plex_known", return_value=plex), \
                 mock.patch.object(os_, "load_arr_known", return_value=arr), mock.patch.object(os_, "scan_disk", return_value=on_disk), \
                 mock.patch.object(os_.safe_ops, "raw_copies", side_effect=raw), mock.patch.object(os_.safe_ops, "file_identity", return_value=(1, 1, nlink)), \
-                mock.patch.object(os_.safe_ops, "unlink_raw", side_effect=lambda paths, apply, *a: removed.extend(paths) or []), \
+                mock.patch.object(os_.safe_ops, "unlink_raw", side_effect=lambda paths, apply, *a: removed.extend(paths) or [(p, "quarantined") for p in paths]), \
                 mock.patch.object(os_.safe_ops, "prune_empty_parents", return_value=[]), mock.patch.object(os_, "log"), mock.patch.object(sys, "argv", ["x"] + argv):
             rc = os_.main()
         return rc, removed
@@ -105,7 +105,7 @@ class ApplyFlow(unittest.TestCase):
         with mock.patch.object(os_, "load_qbit_known", side_effect=qbit), mock.patch.object(os_, "load_plex_known", return_value=known), \
                 mock.patch.object(os_, "load_arr_known", return_value={"a"}), mock.patch.object(os_, "scan_disk", return_value=on), \
                 mock.patch.object(os_.safe_ops, "raw_copies", side_effect=lambda p: [p.replace("/mnt/user/", "/mnt/disk1/")]), mock.patch.object(os_.safe_ops, "file_identity", return_value=(1, 1, 1)), \
-                mock.patch.object(os_.safe_ops, "unlink_raw", side_effect=lambda paths, apply, *a: removed.extend(paths) or []), mock.patch.object(os_.safe_ops, "prune_empty_parents", return_value=[]), \
+                mock.patch.object(os_.safe_ops, "unlink_raw", side_effect=lambda paths, apply, *a: removed.extend(paths) or [(p, "quarantined") for p in paths]), mock.patch.object(os_.safe_ops, "prune_empty_parents", return_value=[]), \
                 mock.patch.object(os_, "log"), mock.patch.object(sys, "argv", ["x", "--apply"]):
             removed = []
             os_.main()

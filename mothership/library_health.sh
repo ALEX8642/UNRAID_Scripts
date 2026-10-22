@@ -20,16 +20,23 @@ exists(){ ls /mnt/disk*/"$1" >/dev/null 2>&1 || ls /mnt/cache/"$1" >/dev/null 2>
 
 # 0. the numbers below mean nothing if an API is down (an empty answer would read as "0 problems")
 for a in radarr sonarr; do arr $a system/status | jq -e .version >/dev/null 2>&1 || ISSUES+=("$a API unreachable: the checks below cannot be trusted"); done
+arr_array(){ # arr_array APP PATH -> the JSON array, or nothing + exit 1 when the answer is an error page/object (a blind check must never read as "0 problems")
+  local out; out=$(arr "$1" "$2"); jq -e 'type=="array"' <<< "$out" >/dev/null 2>&1 && printf '%s' "$out"; }
+RADARR_MOVIES=$(arr_array radarr movie) || { ISSUES+=("Radarr: the movie list could not be read; file checks skipped"); RADARR_MOVIES='[]'; }
+SONARR_SERIES=$(arr_array sonarr series) || { ISSUES+=("Sonarr: the series list could not be read; episode checks skipped"); SONARR_SERIES='[]'; }
 # 1. Radarr files missing on disk
 miss=0; list=""
-while IFS= read -r f; do r="Media/${f#/media/}"; exists "$r" || { miss=$((miss+1)); [ $miss -le 5 ] && list="$list\n   $f"; }; done < <(arr radarr movie | jq -r '.[]|select(.hasFile)|.movieFile.path')
+while IFS= read -r f; do r="Media/${f#/media/}"; exists "$r" || { miss=$((miss+1)); [ $miss -le 5 ] && list="$list\n   $f"; }; done < <(jq -r '.[]|select(.hasFile)|.movieFile.path' <<< "$RADARR_MOVIES")
 say "Radarr tracked files missing on disk: $miss"; [ $miss -gt 0 ] && ISSUES+=("Radarr: $miss tracked file(s) missing on disk$(printf "%b" "$list")")
 # 2. Sonarr files missing on disk
 missT=0; listT=""
 : > /tmp/health_tracked_tv.txt
-for id in $(arr sonarr series | jq -r '.[]|select(.statistics.episodeFileCount>0)|.id'); do
-  while IFS= read -r f; do r="Media/${f#/media/}"; echo "$r" >> /tmp/health_tracked_tv.txt; exists "$r" || { missT=$((missT+1)); [ $missT -le 5 ] && listT="$listT\n   $f"; }; done < <(arr sonarr "episodefile?seriesId=$id" | jq -r '.[].path')
+blindT=0
+for id in $(jq -r '.[]|select(.statistics.episodeFileCount>0)|.id' <<< "$SONARR_SERIES"); do
+  EF=$(arr_array sonarr "episodefile?seriesId=$id") || { blindT=$((blindT+1)); continue; }
+  while IFS= read -r f; do r="Media/${f#/media/}"; echo "$r" >> /tmp/health_tracked_tv.txt; exists "$r" || { missT=$((missT+1)); [ $missT -le 5 ] && listT="$listT\n   $f"; }; done < <(jq -r '.[].path' <<< "$EF")
 done
+[ $blindT -gt 0 ] && ISSUES+=("Sonarr: $blindT series could not be read; their files were not checked")
 say "Sonarr tracked files missing on disk: $missT"; [ $missT -gt 0 ] && ISSUES+=("Sonarr: $missT tracked episode file(s) missing on disk$(printf "%b" "$listT")")
 # 3. qBittorrent torrents in trouble
 CK=$(mktemp); curl -s -c $CK -d "username=$QBIT_USER&password=$QBIT_PASS" "$QBIT_URL/api/v2/auth/login" >/dev/null
@@ -38,11 +45,19 @@ if [ "$bad" = "unreadable" ] || [ -z "$bad" ]; then ISSUES+=("qBittorrent unreac
 say "qBittorrent torrents missing files / in error: $bad"; [ "${bad:-0}" -gt 0 ] && ISSUES+=("qBittorrent: $bad torrent(s) in missingFiles/error state")
 # 4. import queue stuck or blocked
 for app in radarr sonarr; do
-  q=$(arr $app "queue?pageSize=200&includeUnknownMovieItems=true" | jq -r '[.records[]?|select(.trackedDownloadState=="importBlocked" or .trackedDownloadState=="importFailed" or .trackedDownloadStatus=="warning")]|length' 2>/dev/null)
+  q=0; page=1; seen=0
+  while [ $page -le 25 ]; do
+    pg=$(arr $app "queue?page=$page&pageSize=200&includeUnknownMovieItems=true")
+    if ! jq -e 'type=="object" and (.records|type=="array")' <<< "$pg" >/dev/null 2>&1; then ISSUES+=("$app: the queue could not be read (page $page); its health cannot be judged"); break; fi
+    n=$(jq -r '.records|length' <<< "$pg"); total=$(jq -r '.totalRecords // 0' <<< "$pg")
+    q=$((q + $(jq -r '[.records[]|select(.trackedDownloadState=="importBlocked" or .trackedDownloadState=="importFailed" or .trackedDownloadStatus=="warning")]|length' <<< "$pg")))
+    seen=$((seen+n)); [ "$n" -eq 0 ] || [ $seen -ge "$total" ] && break
+    page=$((page+1))
+  done
   say "$app queue items blocked/warning: ${q:-0}"; [ "${q:-0}" -gt 0 ] && ISSUES+=("$app: ${q} queue item(s) blocked or with warnings (check before anything unblocks them)")
 done
 # 5. untracked video files in Movies (Radarr has no record of them)
-arr radarr movie | jq -r '.[]|select(.hasFile)|(.path|sub("^/media/";"Media/"))+"/"+.movieFile.relativePath' | sort -u > /tmp/health_tracked.txt
+jq -r '.[]|select(.hasFile)|(.path|sub("^/media/";"Media/"))+"/"+.movieFile.relativePath' <<< "$RADARR_MOVIES" | sort -u > /tmp/health_tracked.txt
 unt=0; ul=""
 while IFS= read -r p; do r=${p#/mnt/disk*/}; grep -qxF -- "$r" /tmp/health_tracked.txt || { unt=$((unt+1)); [ $unt -le 5 ] && ul="$ul\n   $(basename "$p")"; }; done < <(for d in /mnt/disk*/Media/Movies; do find "$d" -type f \( -iname '*.mkv' -o -iname '*.mp4' -o -iname '*.m2ts' -o -iname '*.avi' \) -size +300M; done)
 say "Movie files Radarr does not track (large videos): $unt"; [ $unt -gt 60 ] && ISSUES+=("Movies: $unt large untracked video files (was ~45 after the Oct 2026 cleanup, mostly intentional editions)$(printf "%b" "$ul")")

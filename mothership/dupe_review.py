@@ -387,6 +387,9 @@ def load_qbit_index() -> dict:
     """host path (file or folder) -> torrent hash, for every torrent's content_path."""
     global QBIT_SESSION, QBIT_TORRENTS, QBIT_SKIPPED
     QBIT_SKIPPED = 0
+    QBIT_SESSION = None          # a failed login/fetch must never leave the previous call's view in place
+    QBIT_TORRENTS = {}
+    QBIT_INDEX.clear()
     s = requests.Session()
     login = s.post(f"{QBIT_URL}/api/v2/auth/login", data={"username": QBIT_USER, "password": QBIT_PASS}, timeout=15)
     if login.status_code != 200 or login.text.strip() != "Ok.":
@@ -394,14 +397,20 @@ def load_qbit_index() -> dict:
         return {}
     r = s.get(f"{QBIT_URL}/api/v2/torrents/info", timeout=30)
     r.raise_for_status()
-    QBIT_SESSION = s
     QBIT_TORRENTS = {t["hash"]: t for t in r.json()}
+    if not QBIT_TORRENTS:
+        QBIT_SESSION = None      # an empty answer is treated as unavailable, not as "nothing is seeding"
+        return {}
+    QBIT_SESSION = s
     degenerate = {prefix.rstrip("/") for prefix, _ in PATH_MAP}
     index = {}
     for t in r.json():
         cp = (t.get("content_path", "") or "").rstrip("/")
         h = t.get("hash", "")
         if not cp:
+            sp = to_host_path((t.get("save_path", "") or "").rstrip("/"))[0] if t.get("save_path") else ""
+            if not _under((t.get("save_path", "") or "").rstrip("/"), NON_LIBRARY_ROOTS) or not sp:
+                QBIT_SKIPPED += 1      # no content_path: its files cannot be located, so the seeding check is incomplete
             continue
         if cp not in degenerate:
             host_path, mapped = to_host_path(cp)
@@ -433,7 +442,11 @@ def load_qbit_index() -> dict:
         if not rr.ok:
             QBIT_SKIPPED += 1
             continue
-        for f in rr.json():
+        files = rr.json()
+        if not files:
+            QBIT_SKIPPED += 1
+            continue
+        for f in files:
             index.setdefault(os.path.join(save_path, f["name"]), []).append(h)
     QBIT_INDEX.update(index)
     return index
@@ -870,6 +883,12 @@ def reconcile_arr(kept: FileRecord, deleted_tracked: FileRecord) -> None:
         log(f"RECONCILE FAILED {app} id={deleted_tracked.arr_id}: {e}")
 
 
+def _scrub(e) -> str:
+    """Exception text with the Plex token removed (it must never reach a log or a result file)."""
+    t = str(e)
+    return t.replace(PLEX_TOKEN, "***") if PLEX_TOKEN else t
+
+
 def plex_refresh_and_empty_trash() -> None:
     if not PLEX_TOKEN:
         console.print("[dim]PLEX_TOKEN not set — skipping automatic Plex scan/empty-trash. Run a library scan + Empty Trash yourself.[/dim]")
@@ -878,23 +897,23 @@ def plex_refresh_and_empty_trash() -> None:
     ok = True
     for section_id in PLEX_LIBRARY_SECTION_IDS:
         try:
-            r = requests.get(f"{PLEX_URL}/library/sections/{section_id}/refresh", params={"X-Plex-Token": PLEX_TOKEN}, timeout=15)
+            r = requests.get(f"{PLEX_URL}/library/sections/{section_id}/refresh", headers={"X-Plex-Token": PLEX_TOKEN}, timeout=15)
             if not r.ok:
                 console.print(f"[red]Plex refresh for section {section_id} returned HTTP {r.status_code} — check PLEX_URL/PLEX_TOKEN.[/red]")
                 ok = False
         except requests.RequestException as e:
-            console.print(f"[red]Plex refresh failed for section {section_id}: {e}[/red]")
+            console.print(f"[red]Plex refresh failed for section {section_id}: {_scrub(e)}[/red]")
             ok = False
     console.print("[dim]Waiting for the scan before emptying trash (best-effort — rerun Empty Trash yourself if some duplicates linger)...[/dim]")
     time.sleep(20)
     for section_id in PLEX_LIBRARY_SECTION_IDS:
         try:
-            r = requests.put(f"{PLEX_URL}/library/sections/{section_id}/emptyTrash", params={"X-Plex-Token": PLEX_TOKEN}, timeout=15)
+            r = requests.put(f"{PLEX_URL}/library/sections/{section_id}/emptyTrash", headers={"X-Plex-Token": PLEX_TOKEN}, timeout=15)
             if not r.ok:
                 console.print(f"[red]Plex empty-trash for section {section_id} returned HTTP {r.status_code}.[/red]")
                 ok = False
         except requests.RequestException as e:
-            console.print(f"[red]Plex empty-trash failed for section {section_id}: {e}[/red]")
+            console.print(f"[red]Plex empty-trash failed for section {section_id}: {_scrub(e)}[/red]")
             ok = False
     if ok:
         console.print("[green]Plex library refreshed and trash emptied for Movies/TV.[/green]")

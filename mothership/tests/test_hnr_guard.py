@@ -131,7 +131,7 @@ class HnrGuardTests(unittest.TestCase):
     def test_unrelated_torrent_list_does_not_release_a_hold(self):
         e = Env([tor("b", "B", 9)], {"b": ["b.mkv"]}, [movie(1, "a.mkv", monitored=False)], state=hold("a"))
         rc, st, _ = e.run()
-        self.assertEqual(e.puts, []); self.assertEqual(st["radarr"]["1"]["absent"], 1)     # one absence is only noted
+        self.assertEqual(e.puts, []); self.assertEqual(st["radarr"]["1"]["absent"], {"a": 1})     # one absence is only noted
 
     def test_torrent_absent_on_two_consecutive_runs_releases(self):
         e = Env([tor("b", "B", 9)], {"b": ["b.mkv"]}, [movie(1, "a.mkv", monitored=False)], state=hold("a", absent=1))
@@ -199,11 +199,13 @@ class HnrGuardTests(unittest.TestCase):
 
     def test_release_ok_function(self):
         young = {"y"}
-        self.assertEqual(hg.release_ok({"hashes": ["a"]}, {"a": 1}, young), (True, 0))
-        self.assertEqual(hg.release_ok({"hashes": ["y"]}, {"y": 1}, young), (False, 0))
-        self.assertEqual(hg.release_ok({"hashes": ["a", "b"]}, {"a": 1}, young), (False, 1))
-        self.assertEqual(hg.release_ok({"hashes": ["a", "b"], "absent": 1}, {"a": 1}, young), (True, 2))
-        self.assertEqual(hg.release_ok({"hashes": ["a", "y"], "absent": 5}, {"y": 1}, young), (False, 6))
+        self.assertEqual(hg.release_ok({"hashes": ["a"]}, {"a": 1}, young), (True, {}))
+        self.assertEqual(hg.release_ok({"hashes": ["y"]}, {"y": 1}, young), (False, {}))
+        self.assertEqual(hg.release_ok({"hashes": ["a", "b"]}, {"a": 1}, young), (False, {"b": 1}))
+        # absence is counted per hash now (the single int could not say WHICH hash had been absent): see test_review_c_py C8
+        self.assertEqual(hg.release_ok({"hashes": ["a", "b"], "absent": {"b": 1}}, {"a": 1}, young), (True, {"b": 2}))
+        self.assertEqual(hg.release_ok({"hashes": ["a", "b"], "absent": 1}, {"a": 1}, young), (False, {"b": 1}))      # legacy int: not attributable
+        self.assertEqual(hg.release_ok({"hashes": ["a", "y"], "absent": {"a": 5}}, {"y": 1}, young), (False, {"a": 6}))
 
 
 if __name__ == "__main__":

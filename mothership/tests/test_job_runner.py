@@ -206,6 +206,7 @@ class RunnerRobustness(unittest.TestCase):
     def test_malformed_job_does_not_block_the_next_one(self):
         d = tempfile.mkdtemp(); os.makedirs(f"{d}/pending")
         open(f"{d}/pending/aaa.json", "w").write("{not json")
+        os.utime(f"{d}/pending/aaa.json", (time.time() - 3600, time.time() - 3600))    # old enough that it cannot be a write in progress
         json.dump(job(id="zzz", type="poster_reset", title="X"), open(f"{d}/pending/bbb.json", "w"))
         fake = FakeDR()
         with mock.patch.object(jr, "JOBS", d), mock.patch.object(jr, "log"), mock.patch.dict(sys.modules, {"dupe_review": fake}), \

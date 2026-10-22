@@ -18,7 +18,9 @@ Usage:  python3 job_runner.py             # process everything pending
 import glob
 import hashlib
 import json
+import fcntl
 import os
+import re
 import sys
 import time
 from types import SimpleNamespace
@@ -38,6 +40,22 @@ RADARR_URL, RADARR_KEY = os.environ.get("RADARR_URL", ""), os.environ.get("RADAR
 SONARR_URL, SONARR_KEY = os.environ.get("SONARR_URL", ""), os.environ.get("SONARR_KEY", "")
 PLEX_URL, PLEX_TOKEN = os.environ.get("PLEX_URL", ""), os.environ.get("PLEX_TOKEN", "")
 LIB_ROOTS = (safe_ops.USER_PREFIX + "Media/Movies/", safe_ops.USER_PREFIX + "Media/tv/")
+
+
+def clean(text):
+    """Control characters (newlines above all) must never reach a log line: they would forge records."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(text))
+
+
+def confined(host, raw):
+    """True only if the physical file really sits under <disk>/Media/Movies|tv with no symlinked component on the way."""
+    rel = host[len(safe_ops.USER_PREFIX):]
+    if not raw.endswith("/" + rel):
+        return False
+    base = os.path.realpath(raw[:-len(rel) - 1])
+    expected = os.path.join(base, rel)
+    real = os.path.realpath(raw)
+    return real == expected and any(real.startswith(os.path.join(base, "Media", d) + "/") for d in ("Movies", "tv"))
 
 
 def log(msg):
@@ -63,6 +81,10 @@ def plan_delete(job, dr):
             decisions.append((host, safe_ops.Decision("REFUSE", "not inside the Movies or tv library")))
             continue
         raw = raw_copies(host)
+        bad = [x for x in raw if not confined(host, x)]
+        if bad:
+            decisions.append((host, safe_ops.Decision("REFUSE", "path resolves outside the library (symlinked directory?)")))
+            continue
         if len(raw) == 1 and (os.path.islink(raw[0]) or not os.path.isfile(raw[0])):
             decisions.append((host, safe_ops.Decision("REFUSE", "not a regular file (directory, symlink or already gone)")))
             continue
@@ -94,12 +116,19 @@ def arr_file_paths(job):
 
 
 def job_digest(job, decisions):
-    return digest_of([job["app"], int(job["arr_id"]), bool(job.get("remove_record")), sorted(job["paths"]),
+    return digest_of([job["app"], int(job["arr_id"]), (job.get("remove_record") is True), sorted(job["paths"]),
                       [(h, d.mode, d.torrent_hash, sorted(d.unlink_raw), d.delete_torrent, d.tag) for h, d in decisions]])
 
 
 def run_delete(job, dr):
-    dr.APPLY = bool(job["apply"])
+    apply = job.get("apply", False)
+    if not isinstance(apply, bool):
+        return {"ok": False, "lines": ["malformed job: apply must be a JSON boolean"]}
+    dr.APPLY = apply
+    if not isinstance(job.get("paths"), list) or not all(isinstance(x, str) for x in job["paths"]):
+        return {"ok": False, "lines": ["malformed job: paths must be a list of strings"]}
+    if len(set(job["paths"])) != len(job["paths"]):
+        return {"ok": False, "lines": ["malformed job: duplicate paths"]}
     if not job.get("paths") or job.get("app") not in ("radarr", "sonarr") or not isinstance(job.get("arr_id"), int):
         return {"ok": False, "lines": ["malformed job: needs app, an integer arr_id and a non-empty list of paths"]}
     if len(job["paths"]) > MAX_FILES_PER_JOB:
@@ -114,15 +143,15 @@ def run_delete(job, dr):
     decisions, lines = plan_delete(job, dr)
     digest = job_digest(job, decisions)
     res = {"digest": digest, "lines": lines, "ok": True}
-    if not job["apply"]:
+    if not apply:
         refused = [h for h, d in decisions if d.mode == "REFUSE"]
         kept = [h for h, d in decisions if d.mode in ("TAG_ONLY", "LIBRARY_NAME_THEN_TAG")]
         res["lines"] += [""] + ([f"{len(refused)} file(s) refused - they will NOT be touched and the record stays."] if refused else []) \
             + ([f"{len(kept)} file(s) belong to young seeds: kept seeding and tagged delete-later (record kept, unmonitored)."] if kept else [])
-        res["removes_record"] = bool(job.get("remove_record")) and not refused and not kept and set(job["paths"]) == tracked
+        res["removes_record"] = (job.get("remove_record") is True) and not refused and not kept and set(job["paths"]) == tracked
         return res
     if job.get("plan_digest") != digest:
-        return {"ok": False, "lines": ["State changed since you confirmed the plan. Nothing was done - plan again."], "digest": digest}
+        return {"ok": False, "lines": ["State changed since you confirmed the plan. Nothing was done - plan again."]}
     done_all = True
     for host, d in decisions:
         if d.mode == "REFUSE":
@@ -139,24 +168,27 @@ def run_delete(job, dr):
     base, key = (RADARR_URL, RADARR_KEY) if job["app"] == "radarr" else (SONARR_URL, SONARR_KEY)
     kind = "movie" if job["app"] == "radarr" else "series"
     h = {"X-Api-Key": key}
-    if job.get("remove_record") and done_all:
-        r = requests.delete(f"{base}/api/v3/{kind}/{job['arr_id']}", params={"deleteFiles": "false", ("addImportExclusion" if job["app"] == "radarr" else "addImportListExclusion"): "true"}, headers=h, timeout=60)
-        res["lines"].append(f"{job['app']} record removed (HTTP {r.status_code})")
-        res["ok"] = r.ok
-    else:
-        try:
+    try:
+        if job.get("remove_record") is True and done_all:
+            r = requests.delete(f"{base}/api/v3/{kind}/{job['arr_id']}", params={"deleteFiles": "false", ("addImportExclusion" if job["app"] == "radarr" else "addImportListExclusion"): "true"}, headers=h, timeout=60)
+            res["lines"].append(f"{job['app']} record removed (HTTP {r.status_code})")
+            res["ok"] = r.ok
+        else:
             g = requests.get(f"{base}/api/v3/{kind}/{job['arr_id']}", headers=h, timeout=60)
             g.raise_for_status()
             body = g.json()
             body["monitored"] = False
             requests.put(f"{base}/api/v3/{kind}/{job['arr_id']}", headers=h, json=body, timeout=60).raise_for_status()
             res["lines"].append(f"{job['app']} record kept and unmonitored" + ("" if done_all else " (some files were kept or refused)"))
-        except requests.RequestException as e:
-            res["lines"].append(f"could not unmonitor in {job['app']}: {e}")
-            res["ok"] = False
+    except Exception as e:  # noqa: BLE001 - files were already quarantined: keep the lines saying so
+        res["lines"].append(f"files were quarantined but the {job['app']} update failed: {type(e).__name__}: {clean(e)}")
+        res["ok"] = False
     if PLEX_TOKEN:
-        dr.plex_refresh_and_empty_trash()
-        res["lines"].append("Plex scanned and trash emptied")
+        try:
+            dr.plex_refresh_and_empty_trash()
+            res["lines"].append("Plex scanned and trash emptied")
+        except Exception as e:  # noqa: BLE001
+            res["lines"].append(f"Plex refresh failed: {type(e).__name__}")
     log(f"DELETE job {job['id']} {job['title']}: {res['lines']}")
     return res
 
@@ -197,50 +229,91 @@ def write_done(jid, job):
     os.replace(tmp, os.path.join(d, f"{jid}.json"))
 
 
-def process(path, dr):
-    with open(path) as f:
-        job = json.load(f)
-    # claim the job before doing anything: if the runner dies mid-way, a re-run must never replay an apply
+def safe_remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def process(path, dr, job=None):
+    """`job` is already parsed and validated as a dict. Claims the file, runs it, always writes a done result."""
+    jid = os.path.basename(path)[:-5]    # the file name decides, never a field inside the file (a crafted id must not escape done/)
+    if job is None:
+        try:
+            with open(path) as f:
+                job = json.load(f)
+            if not isinstance(job, dict):
+                raise ValueError("not a JSON object")
+        except Exception as e:  # noqa: BLE001
+            write_done(jid, {"id": jid, "type": "unreadable", "result": {"ok": False, "lines": [f"job file unreadable: {type(e).__name__}"]}, "finished": time.time()})
+            safe_remove(path)
+            return
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = time.time()
     run_dir = os.path.join(JOBS, "running")
     os.makedirs(run_dir, exist_ok=True)
     claimed = os.path.join(run_dir, os.path.basename(path))
-    os.replace(path, claimed)
+    try:
+        os.replace(path, claimed)        # claim before doing anything: a dead runner must never replay an apply
+    except FileNotFoundError:
+        return
     path = claimed
-    if job.get("type") == "delete_files":
-        try:
-            dr.load_qbit_index()       # fresh per job: a torrent added since the last job must be visible
-        except Exception as e:  # noqa: BLE001 - qBittorrent down mid-call: refuse and say so, do not crash the runner
-            dr.QBIT_SESSION = None
-            log(f"qBittorrent index failed for {os.path.basename(path)}: {e!r}")
-        if dr.QBIT_SESSION is None or not dr.QBIT_TORRENTS or dr.QBIT_SKIPPED:
-            job["result"] = {"ok": False, "lines": ["qBittorrent index unavailable or incomplete: refusing to delete anything"], "digest": ""}
-            write_done(os.path.basename(path)[:-5], dict(job, finished=time.time()))
-            os.remove(path)
-            return
-    jid = os.path.basename(path)[:-5]    # the file name decides, never a field inside the file (a crafted id must not escape done/)
-    if time.time() - job.get("created", 0) > MAX_AGE_S:
-        result = {"ok": False, "lines": ["job expired (older than 30 minutes); nothing was done"]}
-    else:
-        try:
-            if job["type"] == "delete_files":
-                result = run_delete(job, dr)
-            elif job["type"] == "poster_reset":
-                result = run_poster_reset(job)
-            else:
-                result = {"ok": False, "lines": [f"unknown job type {job['type']!r}"]}
-        except Exception as e:  # noqa: BLE001 - always write a result so the page does not wait forever
-            log(f"job {jid} failed: {e!r}")
-            result = {"ok": False, "lines": [f"failed: {type(e).__name__}: {e}"]}
+    job["title"] = clean(job.get("title", ""))
+    try:
+        if job.get("type") == "delete_files":
+            try:
+                dr.load_qbit_index()       # fresh per job: a torrent added since the last job must be visible
+            except Exception as e:  # noqa: BLE001 - qBittorrent down mid-call: refuse and say so, do not crash the runner
+                dr.QBIT_SESSION = None
+                log(f"qBittorrent index failed for {jid}: {type(e).__name__}")
+            if dr.QBIT_SESSION is None or not dr.QBIT_TORRENTS or dr.QBIT_SKIPPED:
+                result = {"ok": False, "lines": ["qBittorrent index unavailable or incomplete: refusing to delete anything"]}
+                job["result"], job["finished"] = result, time.time()
+                write_done(jid, job)
+                safe_remove(path)
+                return
+        now = time.time()
+        created = job.get("created")
+        if isinstance(created, bool) or not isinstance(created, (int, float)) or created != created:
+            result = {"ok": False, "lines": ["malformed job: 'created' must be a number; nothing was done"]}
+        elif created > now + 60:
+            result = {"ok": False, "lines": ["job is dated in the future; nothing was done"]}
+        elif now - min(created, mtime) > MAX_AGE_S:
+            result = {"ok": False, "lines": ["job expired (older than 30 minutes); nothing was done"]}
+        elif job.get("type") == "delete_files":
+            result = run_delete(job, dr)
+        elif job.get("type") == "poster_reset":
+            result = run_poster_reset(job)
+        else:
+            result = {"ok": False, "lines": [f"unknown job type {clean(repr(job.get('type')))}"]}
+    except Exception as e:  # noqa: BLE001 - always write a result so the page does not wait forever
+        log(f"job {jid} failed: {type(e).__name__}")
+        result = {"ok": False, "lines": [f"failed: {type(e).__name__}"]}
+    result.setdefault("digest", "")      # a plan that could not be made carries an empty digest, which no apply can match
     job["result"], job["finished"] = result, time.time()
     write_done(jid, job)
-    os.remove(path)
+    safe_remove(path)
 
 
 def main():
+    os.makedirs(JOBS, exist_ok=True)
+    lock = open(os.path.join(JOBS, ".runner.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return                           # another runner is mid-job: it owns running/ and pending/
+    done_dir = os.path.join(JOBS, "done")
     for stale in glob.glob(os.path.join(JOBS, "running", "*.json")):     # a previous run died while executing these: never replay
         jid = os.path.basename(stale)[:-5]
-        write_done(jid, {"id": jid, "type": "interrupted", "result": {"ok": False, "lines": ["the runner was interrupted while executing this job; check the state by hand and plan again"]}, "finished": time.time()})
-        os.remove(stale)
+        try:
+            if not os.path.exists(os.path.join(done_dir, jid + ".json")):   # never overwrite a real result
+                write_done(jid, {"id": jid, "type": "interrupted", "result": {"ok": False, "lines": ["the runner was interrupted while executing this job; check the state by hand and plan again"]}, "finished": time.time()})
+            safe_remove(stale)
+        except Exception as e:  # noqa: BLE001
+            log(f"could not reap {jid}: {type(e).__name__}")
     pending = sorted(glob.glob(os.path.join(JOBS, "pending", "*.json")))
     if not pending:
         return
@@ -249,13 +322,31 @@ def main():
     for p in pending:
         jid = os.path.basename(p)[:-5]
         try:
-            with open(p) as f:
-                job = json.load(f)
-        except (OSError, ValueError) as e:      # one malformed file must not block every other job, every minute, forever
-            write_done(jid, {"id": jid, "type": "unreadable", "result": {"ok": False, "lines": [f"job file unreadable: {e}"]}, "finished": time.time()})
-            os.remove(p)
-            continue
-        process(p, dr)
+            if not os.path.isfile(p):
+                continue
+            try:
+                with open(p) as f:
+                    job = json.load(f)
+                err = None if isinstance(job, dict) else "job file is not a JSON object"
+            except Exception as e:  # noqa: BLE001 - incl. RecursionError
+                job, err = None, f"job file unreadable: {type(e).__name__}"
+                try:
+                    if time.time() - os.path.getmtime(p) < 60:
+                        continue         # the dashboard may still be writing it; look again next run
+                except OSError:
+                    continue
+            if err:
+                write_done(jid, {"id": jid, "type": "unreadable", "result": {"ok": False, "lines": [err]}, "finished": time.time()})
+                safe_remove(p)
+                continue
+            process(p, dr, job)
+        except Exception as e:  # noqa: BLE001 - one bad job must never block the rest
+            log(f"job {jid} crashed the runner loop: {type(e).__name__}")
+            try:
+                write_done(jid, {"id": jid, "type": "failed", "result": {"ok": False, "lines": [f"failed: {type(e).__name__}"]}, "finished": time.time()})
+                safe_remove(p)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":

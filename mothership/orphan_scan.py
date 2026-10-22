@@ -7,10 +7,11 @@ qBittorrent (no torrent claims them) NOR Plex (not in its library database) — 
 weight: failed imports, leftover artifacts from a botched move, orphaned partial downloads,
 files left behind by a renamed/re-organized torrent.
 
-Report-only. Never deletes anything — every candidate needs a human look. This is a
-heuristic with real false-positive risks: a file Plex hasn't rescanned yet, a torrent added
-after this scan started, or a file mid-write. Recently-modified files are flagged separately
-rather than reported as confidently orphaned.
+Report-only by default. With --apply (and only for files that pass every re-check) it QUARANTINES a file: a same-disk rename
+into <disk>/Media/.quarantine/<date>/, never a real delete, so everything is restorable until quarantine.py purge empties old
+days. Every candidate still deserves a human look first. This is a heuristic with real false-positive risks: a file Plex
+hasn't rescanned yet, a torrent added after this scan started, or a file mid-write. Recently-modified files are flagged
+separately rather than reported as confidently orphaned.
 """
 
 import os
@@ -58,6 +59,7 @@ SONARR_KEY = os.environ.get("SONARR_KEY", "")
 # ==== END CONFIG ====
 
 console = Console()
+_REFUSED = False      # set by main() when it refuses to continue, so the script exits non-zero
 
 
 def log(msg: str):
@@ -124,14 +126,15 @@ def load_qbit_known() -> set:
     known = set()
     for t in torrents:
         cp, cp_mapped = to_host_path((t.get("content_path", "") or "").rstrip("/"))
-        if cp_mapped:
-            known.add(cp)
         save_path, sp_mapped = to_host_path((t.get("save_path", "") or "").rstrip("/"))
+        if cp_mapped and not (sp_mapped and cp == save_path):      # content_path == save_path (no-subfolder layout) would claim the whole root
+            known.add(cp)
         if not sp_mapped:
             continue
         rr = s.get(f"{QBIT_URL}/api/v2/torrents/files", params={"hash": t["hash"]}, timeout=30)
         if not rr.ok:
-            continue
+            console.print(f"[bold red]FATAL:[/bold red] qBittorrent /torrents/files failed ({rr.status_code}) for {t.get('hash')}. Refusing to run: its files would look orphaned.")
+            sys.exit(1)
         for f in rr.json():
             known.add(os.path.join(save_path, f["name"]))
     return known
@@ -167,7 +170,16 @@ def load_arr_known() -> set:
 
 def find_orphans(on_disk: dict, plex_known: set, qbit_known: set, arr_known: set) -> dict:
     """Files claimed by none of Plex, qBittorrent, Radarr or Sonarr."""
-    return {p: v for p, v in on_disk.items() if p not in plex_known and p not in qbit_known and p not in arr_known}
+    roots = (MOVIES_HOST_ROOT, TV_HOST_ROOT)
+
+    def under_torrent(p):       # everything below a torrent's content_path (a folder) belongs to that torrent
+        d = os.path.dirname(p)
+        while d and d not in roots and d != os.path.dirname(d):
+            if d in qbit_known:
+                return True
+            d = os.path.dirname(d)
+        return False
+    return {p: v for p, v in on_disk.items() if p not in plex_known and p not in qbit_known and p not in arr_known and not under_torrent(p)}
 
 
 def sanity_problem(on_disk: dict, plex_known: set, qbit_known: set, arr_known: set):
@@ -221,6 +233,8 @@ def main():
     arr_known = load_arr_known()
     problem = sanity_problem(on_disk, plex_known, qbit_known, arr_known)
     if problem:
+        global _REFUSED
+        _REFUSED = True
         console.print(f"[bold red]Refusing to continue:[/bold red] {problem}. Nothing was listed or deleted.")
         log(f"REFUSED: {problem}")
         return 1
@@ -305,11 +319,17 @@ def main():
                     result = "[yellow]skipped (hardlinked elsewhere)[/yellow]"
                     log(f"SKIPPED {path}: hardlinked elsewhere")
                 else:
-                    safe_ops.unlink_raw(raw, True, LOGFILE, "orphan-scan")
-                    removed_raw.append(raw[0])
-                    result = "[green]deleted[/green]"
-                    deleted_count += 1
-                    deleted_size += size
+                    outcome = safe_ops.unlink_raw(raw, True, LOGFILE, "orphan-scan")
+                    if outcome and all(o == "quarantined" for _p, o in outcome):
+                        removed_raw.append(raw[0])
+                        result = "[green]deleted (quarantined)[/green]"
+                        deleted_count += 1
+                        deleted_size += size
+                    else:
+                        why = "; ".join(str(o) for _p, o in outcome) or "no outcome"
+                        result = f"[red]not removed: {why}[/red]"
+                        failed_count += 1
+                        log(f"FAILED to quarantine {path}: {why}")
             except OSError as e:
                 result = f"[red]failed: {e}[/red]"
                 failed_count += 1
@@ -339,3 +359,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    sys.exit(1 if _REFUSED else 0)
